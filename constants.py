@@ -44,10 +44,25 @@ CITYSCAPES_CLASS_NAMES = {
     32: "motorcycle",
     33: "bicycle",
 }
-# Void classes are ignored during benchmark metric computation.
-CITYSCAPES_VOID_CLASS_IDS = set(range(7))
 # The 19 classes in the official Cityscapes benchmark.
 CITYSCAPES_EVAL_CLASS_IDS = {
-    7, 8, 11, 12, 13, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33,
+    7,
+    8,
+    11,
+    12,
+    13,
+    17,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    31,
+    32,
+    33,
 }
-

@@ -87,7 +87,7 @@ def prefetch(
 @dataclasses.dataclass
 class _CityscapesFile:
     """
-    A Cityscapes file identified by its name: <city>_<clip>_<frame>_<suffix>.
+    A Cityscapes file, identified by its name: <city>_<clip>_<frame>_<suffix>.
     """
 
     FILE_NAME_PATTERN = re.compile(r"(?!)")  # matches nothing; see subclasses
@@ -172,19 +172,36 @@ class CityscapesDatapoint:
         return dp
 
 
-CityscapesDatapointIndex = dict[
-    # IS-OOS split -->
+_CityscapesDatapointIndex = dict[
+    # IS-OOS split, (e.g. "train_extra") -->
     str,
     dict[
-        # city -->
+        # city (e.g. "cologne") -->
         str,
         dict[
-            # clip index --> datapoints
+            # clip index (e.g. "000050") --> datapoints
             str, list[CityscapesDatapoint]
         ],
     ],
 ]
 
+
+def _get_cityscapes_datapoint_index_iter(
+    datapoint_index: _CityscapesDatapointIndex,
+    selected_is_oos_splits: list[str] | None = None,
+) -> Iterator[CityscapesDatapoint]:
+    """
+    Get iterator over datapoints in datapoint index.
+    """
+
+    if selected_is_oos_splits is None:
+        selected_is_oos_splits = datapoint_index.keys()
+
+    for is_oos_split in selected_is_oos_splits:
+        split_index = datapoint_index.get(is_oos_split, {})
+        for city in split_index:
+            for clip_idx in split_index[city]:
+                yield from split_index[city][clip_idx]
 
 
 def _load_in_parallel(
@@ -201,9 +218,7 @@ def _load_in_parallel(
     with ThreadPoolExecutor(
         max_workers=worker_count, thread_name_prefix="data-load"
     ) as pool:
-        pending: collections.deque[Future[T]] = (
-            collections.deque()
-        )
+        pending: collections.deque[Future[T]] = collections.deque()
         try:
             for dp in datapoints:
                 pending.append(pool.submit(dp.load))
@@ -217,16 +232,16 @@ def _load_in_parallel(
                 future.cancel()
 
 
-class CityscapesDataset:
+class CityscapesLabeledDataset:
     """
-    Class to support accessing the Cityscapes dataset.
+    Class to support accessing the labeled Cityscapes dataset.
     """
 
     IS_OOS_SPLITS = ("train", "train_extra", "val", "test")
 
     def _construct_datapoint_index(
         self, label_dir: str | Path
-    ) -> CityscapesDatapointIndex:
+    ) -> _CityscapesDatapointIndex:
         label_dir = Path(label_dir)
 
         ret = (
@@ -267,24 +282,6 @@ class CityscapesDataset:
 
         return ret
 
-    def _get_datapoint_index_iter(
-        self,
-        datapoint_index: CityscapesDatapointIndex,
-        selected_is_oos_splits: list[str] | None = None,
-    ) -> Iterator[CityscapesDatapoint]:
-        """
-        Get iterator over datapoints in datapoint index.
-        """
-
-        if selected_is_oos_splits is None:
-            selected_is_oos_splits = datapoint_index.keys()
-
-        for is_oos_split in selected_is_oos_splits:
-            split_index = datapoint_index.get(is_oos_split, {})
-            for city in split_index:
-                for clip_idx in split_index[city]:
-                    yield from split_index[city][clip_idx]
-
     def __init__(
         self,
         image_dir: str | Path = CITYSCAPES_DIR / "leftImg8bit",
@@ -318,13 +315,13 @@ class CityscapesDataset:
         rng = np.random.default_rng(self.seed)
 
         datapoints = list(
-            self._get_datapoint_index_iter(
+            _get_cityscapes_datapoint_index_iter(
                 self.fine_datapoint_index,
                 selected_is_oos_splits=["train", "train_extra"],
             )
         )
         logger.info(
-            f"There are {len(datapoints):} finely-labeled train datapoints"
+            f"There are {len(datapoints):} finely-labeled Cityscapes train datapoints"
         )
 
         yield from _load_in_parallel(
@@ -338,13 +335,13 @@ class CityscapesDataset:
         """Return an iterator over val datapoints, in index order."""
 
         datapoints = list(
-            self._get_datapoint_index_iter(
+            _get_cityscapes_datapoint_index_iter(
                 self.fine_datapoint_index,
                 selected_is_oos_splits=["val"],
             )
         )
         logger.info(
-            f"There are {len(datapoints):} finely-labeled val datapoints"
+            f"There are {len(datapoints):} finely-labeled Cityscapes val datapoints"
         )
 
         yield from _load_in_parallel(datapoints, worker_count)

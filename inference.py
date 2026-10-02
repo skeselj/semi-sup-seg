@@ -1,5 +1,5 @@
 """
-Module to support running inference with segmentation models.
+Module to support running inference with segmentation models on datasets.
 """
 
 import itertools
@@ -16,7 +16,7 @@ from constants import (
     CITYSCAPES_EVAL_CLASS_IDS,
     MAX_PIXEL_INT_VALUE,
 )
-from data import CityscapesDatapoint, CityscapesDataset, prefetch
+from data import CityscapesDatapoint, CityscapesLabeledDataset, prefetch
 from metrics import get_confusion_matrix
 from model import RandomSegmenter
 
@@ -83,7 +83,7 @@ class CityscapesEvaluator:
         self, batch_size: int
     ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         """
-        Yield (B, H, W, 3) image and (B, H, W) label uint8 batches.
+        Yield uint8 (B, H, W, 3) image and (B, H, W) label  batches.
         """
 
         while datapoints := list(itertools.islice(self.data_iter, batch_size)):
@@ -167,7 +167,7 @@ class CityscapesEvaluator:
             images, labels = self._to_tensors(
                 image_batch, label_batch, dtype, device
             )
-            logits = model(images)   # (B, N, H, C)
+            logits = model(images)  # (B, N, H, C)
             preds = logits.argmax(dim=1)
 
             datapoints_seen += len(images)
@@ -224,9 +224,9 @@ def infer_with_random_segmenter_on_cityscapes(
     """
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    standard_logger.info(f"device: {device}")
+    standard_logger.info(f"torch device: {device!r}")
 
-    dataset = CityscapesDataset()
+    dataset = CityscapesLabeledDataset()
     evaluator = CityscapesEvaluator(
         data_iter=dataset.get_fine_label_val_dataset()
     )
