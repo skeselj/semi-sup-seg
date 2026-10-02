@@ -5,11 +5,14 @@ Module to support accessing semantic segmentation data.
 import collections
 import dataclasses
 import logging
+import queue
 import re
+import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self, TypeVar
 
 import numpy as np
 from PIL import Image
@@ -17,20 +20,74 @@ from PIL import Image
 from constants import CITYSCAPES_DIR, DEFAULT_SEED
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
 DEFAULT_WORKER_COUNT = 6
+DEFAULT_PREFETCH_DEPTH = 2
 
 
 class InvalidPathException(Exception):
     pass
 
 
+def prefetch(
+    data_iter: Iterator[T], depth: int = DEFAULT_PREFETCH_DEPTH
+) -> Iterator[T]:
+    """
+    Yield from `data_iter`, loading up to `depth` items ahead.
+    """
+
+    if depth < 0:
+        raise ValueError(f"{depth=} must be at least 0.")
+
+    if depth == 0:
+        yield from data_iter
+        return
+
+    loaded: queue.Queue = queue.Queue(maxsize=depth)
+    stop_event = threading.Event()
+    done_indicator = object()
+
+    def load() -> None:
+        try:
+            for item in data_iter:
+                while not stop_event.is_set():
+                    try:
+                        loaded.put(item, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+
+                if stop_event.is_set():
+                    return
+        except Exception as exc:  # noqa: BLE001
+            loaded.put(exc)
+        finally:
+            if not stop_event.is_set():
+                loaded.put(done_indicator)
+
+    thread = threading.Thread(target=load, daemon=True, name="data-prefetch")
+    thread.start()
+
+    try:
+        while True:
+            item = loaded.get()
+
+            if item is done_indicator:
+                return
+            if isinstance(item, Exception):
+                raise item
+
+            yield item
+    finally:
+        stop_event.set()
+
+
 @dataclasses.dataclass
 class _CityscapesFile:
     """
     A Cityscapes file identified by its name: <city>_<clip>_<frame>_<suffix>.
-
-    Subclasses set FILE_NAME_PATTERN and implement load(). The array is only
-    read from disk on load().
     """
 
     FILE_NAME_PATTERN = re.compile(r"(?!)")  # matches nothing; see subclasses
@@ -101,41 +158,83 @@ class _CityscapesLabel(_CityscapesFile):
 
 
 @dataclasses.dataclass
-class _CityscapesDatapoint:
+class CityscapesDatapoint:
     image: _CityscapesImage
     label: _CityscapesLabel
 
-    def load(self) -> None:
-        self.image.load()
-        self.label.load()
+    def load(self) -> Self:
+        dp = CityscapesDatapoint(
+            image=_CityscapesImage(self.image.path),
+            label=_CityscapesLabel(self.label.path),
+        )
+        dp.image.load()
+        dp.label.load()
+        return dp
 
 
-# IS-OOS split --> city --> clip index --> [datapoint], in sorted path order.
-_DatapointIndex = dict[
-    str, dict[str, dict[str, list[_CityscapesDatapoint]]]
+CityscapesDatapointIndex = dict[
+    # IS-OOS split -->
+    str,
+    dict[
+        # city -->
+        str,
+        dict[
+            # clip index --> datapoints
+            str, list[CityscapesDatapoint]
+        ],
+    ],
 ]
+
+
+
+def _load_in_parallel(
+    datapoints: Iterable[CityscapesDatapoint],
+    worker_count: int = DEFAULT_WORKER_COUNT,
+) -> Iterator[CityscapesDatapoint]:
+    """
+    Yield loaded copies of `datapoints`, in order, with worker count threads.
+    """
+
+    if worker_count < 1:
+        raise ValueError(f"{worker_count=} must be at least 1.")
+
+    with ThreadPoolExecutor(
+        max_workers=worker_count, thread_name_prefix="data-load"
+    ) as pool:
+        pending: collections.deque[Future[T]] = (
+            collections.deque()
+        )
+        try:
+            for dp in datapoints:
+                pending.append(pool.submit(dp.load))
+                if len(pending) >= 2 * worker_count:
+                    yield pending.popleft().result()
+
+            while pending:
+                yield pending.popleft().result()
+        finally:
+            for future in pending:
+                future.cancel()
 
 
 class CityscapesDataset:
     """
     Class to support accessing the Cityscapes dataset.
-
-    Levels of organization: (IS-OOS split) / (city) / (video clip) / (frame).
     """
 
     IS_OOS_SPLITS = ("train", "train_extra", "val", "test")
 
     def _construct_datapoint_index(
         self, label_dir: str | Path
-    ) -> _DatapointIndex:
+    ) -> CityscapesDatapointIndex:
         label_dir = Path(label_dir)
 
         ret = (
-            # is-oos split --> ...
+            # IS-OOS split --> ...
             collections.defaultdict(
                 # city --> ...
                 lambda: collections.defaultdict(
-                    # clip index --> [datapoint]
+                    # clip index --> datapoints
                     lambda: collections.defaultdict(list)
                 )
             )
@@ -163,16 +262,16 @@ class CityscapesDataset:
             )
 
             ret[is_oos_split][label.city][label.clip_idx].append(
-                _CityscapesDatapoint(image=image, label=label)
+                CityscapesDatapoint(image=image, label=label)
             )
 
         return ret
 
     def _get_datapoint_index_iter(
         self,
-        datapoint_index: _DatapointIndex,
+        datapoint_index: CityscapesDatapointIndex,
         selected_is_oos_splits: list[str] | None = None,
-    ) -> Iterator[_CityscapesDatapoint]:
+    ) -> Iterator[CityscapesDatapoint]:
         """
         Get iterator over datapoints in datapoint index.
         """
@@ -211,7 +310,9 @@ class CityscapesDataset:
             time.perf_counter() - start,
         )
 
-    def get_fine_label_train_dataset(self) -> Iterator[_CityscapesDatapoint]:
+    def get_fine_label_train_dataset(
+        self, worker_count: int = DEFAULT_WORKER_COUNT
+    ) -> Iterator[CityscapesDatapoint]:
         """Return an iterator over train datapoints, in random order."""
 
         rng = np.random.default_rng(self.seed)
@@ -222,34 +323,28 @@ class CityscapesDataset:
                 selected_is_oos_splits=["train", "train_extra"],
             )
         )
-        for i in rng.permutation(len(datapoints)):
-            dp = datapoints[i]
-            dp.load()
-            yield dp
-
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
-    )
-
-    cityscapes_dataset = CityscapesDataset()
-
-    start = time.perf_counter()
-    
-    for idx, dp in enumerate(cityscapes_dataset.get_fine_label_train_dataset()):
         logger.info(
-            f"{idx=}: \n"
-            f"\t{dp.image.ary.shape=}, {dp.image.ary.min()=} {dp.image.ary.max()=}, \n"
-            f"\t{dp.label.ary.shape=}, {dp.label.ary.min()=} {dp.label.ary.max()=}"
+            f"There are {len(datapoints):} finely-labeled train datapoints"
         )
 
-        if idx > 10:
-            break
-    
-    logger.info(
-        "Took %.2fs to check on the dataset",
-        time.perf_counter() - start,
-    )
-    
+        yield from _load_in_parallel(
+            (datapoints[i] for i in rng.permutation(len(datapoints))),
+            worker_count,
+        )
+
+    def get_fine_label_val_dataset(
+        self, worker_count: int = DEFAULT_WORKER_COUNT
+    ) -> Iterator[CityscapesDatapoint]:
+        """Return an iterator over val datapoints, in index order."""
+
+        datapoints = list(
+            self._get_datapoint_index_iter(
+                self.fine_datapoint_index,
+                selected_is_oos_splits=["val"],
+            )
+        )
+        logger.info(
+            f"There are {len(datapoints):} finely-labeled val datapoints"
+        )
+
+        yield from _load_in_parallel(datapoints, worker_count)
