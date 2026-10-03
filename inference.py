@@ -1,11 +1,18 @@
 """
 Module to support running inference with segmentation models on datasets.
+
+Example usage:
+PROFILE_RESOURCES=1 PROFILE_RESOURCES_TORCH=1 python inference.py /home/stefan/hdd/projects/semi-sup-seg/logs/runs/unet_cityscapes_20261002_200314/checkpoint.pt
 """
 
 import itertools
 import logging
 import math
+import os
+import sys
 from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -18,11 +25,43 @@ from constants import (
 )
 from data import CityscapesDatapoint, CityscapesLabeledDataset, prefetch
 from metrics import get_confusion_matrix
-from model import RandomSegmenter
+from models import RandomSegmenter, UNet
 
 standard_logger = logging.getLogger(__name__)
 
 DEFAULT_LOG_EVERY_N = 100
+
+
+def load_unet_checkpoint(
+    path: str, device: torch.device
+) -> tuple[UNet, dict[str, Any]]:
+    """
+    Load a checkpoint saved by training, and the UNet whose weights it holds.
+    """
+
+    checkpoint = torch.load(path, map_location=device)
+    if checkpoint.get("model_config") is None:
+        raise ValueError(f"{path!r} holds no model config.")
+
+    model = UNet(**checkpoint["model_config"]).to(device)
+    model.load_state_dict(checkpoint["model"])
+
+    return model, checkpoint
+
+
+def _get_checkpoint_lineage(checkpoint: dict[str, Any]) -> list[str]:
+    """
+    Get paths of the checkpoints `checkpoint` was initialized from, newest first.
+    """
+
+    lineage = []
+    metadata = checkpoint.get("metadata")
+    while metadata and metadata.get("init_checkpoint"):
+        init_checkpoint = metadata["init_checkpoint"]
+        lineage.append(init_checkpoint["path"])
+        metadata = init_checkpoint.get("metadata")
+
+    return lineage
 
 
 class Logger:
@@ -146,10 +185,20 @@ class CityscapesEvaluator:
         device: torch.device,
         log_every_n_datapoints: int = DEFAULT_LOG_EVERY_N,
         dtype: torch.dtype = torch.float32,
+        mixed_precision: bool = True,
     ) -> dict[str, float]:
         """
         Infer with `model` on self.data_iter.
+
+        If `mixed_precision`, eligible ops run in fp16 (on CUDA only), as in
+        training & validation.
         """
+
+        autocast = torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=mixed_precision and device.type == "cuda",
+        )
 
         datapoints_seen = 0
         confusion = torch.zeros(
@@ -167,7 +216,8 @@ class CityscapesEvaluator:
             images, labels = self._to_tensors(
                 image_batch, label_batch, dtype, device
             )
-            logits = model(images)  # (B, N, H, C)
+            with autocast:
+                logits = model(images)  # (B, N, H, W)
             preds = logits.argmax(dim=1)
 
             datapoints_seen += len(images)
@@ -215,7 +265,7 @@ class CityscapesEvaluator:
         return metrics
 
 
-def infer_with_random_segmenter_on_cityscapes(
+def eval_random_segmenter_on_cityscapes(
     batch_size: int = 4,
     log_every_n_datapoints: int = DEFAULT_LOG_EVERY_N,
 ) -> dict[str, float]:
@@ -240,9 +290,60 @@ def infer_with_random_segmenter_on_cityscapes(
     )
 
 
+def eval_unet_on_cityscapes(
+    checkpoint_path: str | None = None,
+    batch_size: int = 1,
+    log_every_n_datapoints: int = DEFAULT_LOG_EVERY_N,
+    mixed_precision: bool = True,
+) -> dict[str, float]:
+    """
+    Run a checkpointed UNet over all Cityscapes fine-label val datapoints.
+    """
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    standard_logger.info(f"torch device: {device!r}")
+
+    # Input shapes are fixed, so let cuDNN time & cache the fastest algorithms.
+    torch.backends.cudnn.benchmark = True
+
+    checkpoint_path = os.path.abspath(checkpoint_path)
+
+    model, checkpoint = load_unet_checkpoint(checkpoint_path, device)
+    model.eval()
+    lineage = _get_checkpoint_lineage(checkpoint)
+    standard_logger.info(
+        "\n".join(
+            [
+                f"Loaded model from {checkpoint_path!r}, initialized from:",
+                *([f"\t{path!r}" for path in lineage] or ["\tnothing"]),
+            ]
+        )
+    )
+
+    if os.environ.get("COMPILE_MODEL", "1") != "0":
+        model.compile()
+
+    dataset = CityscapesLabeledDataset()
+    evaluator = CityscapesEvaluator(
+        data_iter=dataset.get_fine_label_val_dataset()
+    )
+
+    return evaluator.infer(
+        model=model,
+        batch_size=batch_size,
+        device=device,
+        log_every_n_datapoints=log_every_n_datapoints,
+        mixed_precision=mixed_precision,
+    )
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s: %(message)s",
     )
-    infer_with_random_segmenter_on_cityscapes()
+    if len(sys.argv) > 2:
+        sys.exit(f"usage: python {sys.argv[0]} [checkpoint_path]")
+    eval_unet_on_cityscapes(
+        checkpoint_path=sys.argv[1] if len(sys.argv) == 2 else None
+    )

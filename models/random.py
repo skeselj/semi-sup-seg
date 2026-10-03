@@ -1,5 +1,5 @@
 """
-Module to support the segmentation modelling task: image --> per-pixel classes.
+Module to support a random-guess baseline segmentation model.
 """
 
 import torch

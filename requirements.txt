@@ -1,0 +1,19 @@
+# Direct dependencies.
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+
+numpy==2.4.6
+pillow==12.3.0
+
+tensorboard==2.21.0
+
+# Provides `pynvml`, for GPU stats in mini-profiler.
+nvidia-ml-py==13.610.43
+
+# Installed editable for local development:
+#   pip install -e /mnt/hdd1/projects/mini-profiler
+mini-profiler @ git+https://github.com/skeselj/mini-profiler.git@main
+
+matplotlib==3.11.2
+ipykernel==7.4.0

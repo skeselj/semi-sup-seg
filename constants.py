@@ -2,10 +2,21 @@ from pathlib import Path
 
 DEFAULT_SEED = 20260912
 MAX_PIXEL_INT_VALUE = 255
+IMAGE_CHANNEL_COUNT = 3
 
 DATA_DIR = Path("/home/stefan/hdd/projects/data")
 
+PROJECT_DIR = Path(__file__).resolve().parent
+
+# Training runs: one directory per run, each with a checkpoint file.
+DEFAULT_RUNS_DIR = PROJECT_DIR / "logs" / "runs"
+DEFAULT_CHECKPOINT_FILE_NAME = "checkpoint.pt"
+
+# BEGIN: Cityscapes-specific constants.
+
 CITYSCAPES_DIR = DATA_DIR / "cityscapes"
+CITYSCAPES_IMAGE_HEIGHT = 1024
+CITYSCAPES_IMAGE_WIDTH = 2048
 
 # Cityscapes classes: ID --> name.
 CITYSCAPES_CLASS_NAMES = {
@@ -66,3 +77,43 @@ CITYSCAPES_EVAL_CLASS_IDS = {
     32,
     33,
 }
+
+# Cityscapes classes: ID --> official RGB color.
+CITYSCAPES_CLASS_COLORS = {
+    0: (0, 0, 0),
+    1: (0, 0, 0),
+    2: (0, 0, 0),
+    3: (0, 0, 0),
+    4: (0, 0, 0),
+    5: (111, 74, 0),
+    6: (81, 0, 81),
+    7: (128, 64, 128),
+    8: (244, 35, 232),
+    9: (250, 170, 160),
+    10: (230, 150, 140),
+    11: (70, 70, 70),
+    12: (102, 102, 156),
+    13: (190, 153, 153),
+    14: (180, 165, 180),
+    15: (150, 100, 100),
+    16: (150, 120, 90),
+    17: (153, 153, 153),
+    18: (153, 153, 153),
+    19: (250, 170, 30),
+    20: (220, 220, 0),
+    21: (107, 142, 35),
+    22: (152, 251, 152),
+    23: (70, 130, 180),
+    24: (220, 20, 60),
+    25: (255, 0, 0),
+    26: (0, 0, 142),
+    27: (0, 0, 70),
+    28: (0, 60, 100),
+    29: (0, 0, 90),
+    30: (0, 0, 110),
+    31: (0, 80, 100),
+    32: (0, 0, 230),
+    33: (119, 11, 32),
+}
+
+# END: Cityscapes-specific constants.

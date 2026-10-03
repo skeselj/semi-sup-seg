@@ -4,6 +4,7 @@ Module to support accessing semantic segmentation data.
 
 import collections
 import dataclasses
+import itertools
 import logging
 import queue
 import re
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Literal, Self, TypeVar
 
 import numpy as np
+import torch
 from PIL import Image
 
 from constants import CITYSCAPES_DIR, DEFAULT_SEED
@@ -23,8 +25,10 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-DEFAULT_WORKER_COUNT = 6
-DEFAULT_PREFETCH_DEPTH = 2
+TensorDatapointIter = Iterator[tuple[torch.Tensor, torch.Tensor]]
+
+DEFAULT_WORKER_COUNT = 12
+DEFAULT_PREFETCH_DEPTH = 16
 
 
 class InvalidPathException(Exception):
@@ -308,9 +312,13 @@ class CityscapesLabeledDataset:
         )
 
     def get_fine_label_train_dataset(
-        self, worker_count: int = DEFAULT_WORKER_COUNT
+        self,
+        num_datapoints: int | None = None,
+        worker_count: int = DEFAULT_WORKER_COUNT,
     ) -> Iterator[CityscapesDatapoint]:
-        """Return an iterator over train datapoints, in random order."""
+        """
+        Return an iterator over train datapoints, in random order.
+        """
 
         rng = np.random.default_rng(self.seed)
 
@@ -321,27 +329,85 @@ class CityscapesLabeledDataset:
             )
         )
         logger.info(
-            f"There are {len(datapoints):} finely-labeled Cityscapes train datapoints"
+            f"There are {len(datapoints):} unique finely-labeled Cityscapes "
+            "train datapoints"
         )
 
+        if num_datapoints is None:
+            num_datapoints = len(datapoints)
+
+        def shuffled_idxs_gen() -> Iterator[int]:
+            while True:
+                yield from rng.permutation(len(datapoints))
+
         yield from _load_in_parallel(
-            (datapoints[i] for i in rng.permutation(len(datapoints))),
+            (
+                datapoints[i]
+                for i in itertools.islice(shuffled_idxs_gen(), num_datapoints)
+            ),
             worker_count,
         )
 
-    def get_fine_label_val_dataset(
-        self, worker_count: int = DEFAULT_WORKER_COUNT
-    ) -> Iterator[CityscapesDatapoint]:
-        """Return an iterator over val datapoints, in index order."""
-
-        datapoints = list(
+    def _get_fine_label_val_datapoints(self) -> list[CityscapesDatapoint]:
+        return list(
             _get_cityscapes_datapoint_index_iter(
                 self.fine_datapoint_index,
                 selected_is_oos_splits=["val"],
             )
         )
+
+    def get_fine_label_val_datapoint_count(self) -> int:
+        """Return the number of val datapoints, without loading any."""
+
+        return len(self._get_fine_label_val_datapoints())
+
+    def get_fine_label_val_dataset(
+        self,
+        shuffle: bool = False,
+        worker_count: int = DEFAULT_WORKER_COUNT,
+    ) -> Iterator[CityscapesDatapoint]:
+        """
+        Return an iterator over val datapoints, in index order.
+
+        If `shuffle`, the order is instead a random permutation, from self.seed.
+        """
+
+        datapoints = self._get_fine_label_val_datapoints()
         logger.info(
-            f"There are {len(datapoints):} finely-labeled Cityscapes val datapoints"
+            f"There are {len(datapoints):} finely-labeled Cityscapes val "
+            "datapoints"
         )
 
+        if shuffle:
+            rng = np.random.default_rng(self.seed)
+            datapoints = [
+                datapoints[i] for i in rng.permutation(len(datapoints))
+            ]
+
         yield from _load_in_parallel(datapoints, worker_count)
+
+
+def batch(
+    data_iter: Iterator[CityscapesDatapoint], batch_size: int
+) -> TensorDatapointIter:
+    """
+    Yield uint8 (B, H, W, 3) image and (B, H, W) label batches.
+
+    Batches are pinned when CUDA is available, for async host-to-device copy.
+    """
+
+    pin = torch.cuda.is_available()
+
+    while datapoints := list(itertools.islice(data_iter, batch_size)):
+        image_batch = torch.from_numpy(
+            np.stack([dp.image.ary for dp in datapoints])
+        )
+        label_batch = torch.from_numpy(
+            np.stack([dp.label.ary for dp in datapoints])
+        )
+
+        if pin:
+            image_batch = image_batch.pin_memory()
+            label_batch = label_batch.pin_memory()
+
+        yield image_batch, label_batch
