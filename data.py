@@ -6,86 +6,47 @@ import collections
 import dataclasses
 import itertools
 import logging
-import queue
 import re
-import threading
 import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Literal, Self, TypeVar
+from typing import Literal, Self
 
 import numpy as np
-import torch
 from PIL import Image
 
-from constants import CITYSCAPES_DIR, DEFAULT_SEED
+from constants import (
+    CITYSCAPES_CLASS_COLORS,
+    CITYSCAPES_CLASS_NAMES,
+    CITYSCAPES_DIR,
+    CITYSCAPES_EVAL_CLASSES,
+    CITYSCAPES_PERSON_CLASSES,
+    CITYSCAPES_VOID_CLASSES,
+    DEFAULT_SEED,
+    IGNORE_LABEL_ID,
+    MAX_LABEL_COUNT,
+)
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
-
-TensorDatapointIter = Iterator[tuple[torch.Tensor, torch.Tensor]]
-
 DEFAULT_WORKER_COUNT = 12
-DEFAULT_PREFETCH_DEPTH = 16
 
 
 class InvalidPathException(Exception):
     pass
 
 
-def prefetch(
-    data_iter: Iterator[T], depth: int = DEFAULT_PREFETCH_DEPTH
-) -> Iterator[T]:
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class LabelMetadata:
     """
-    Yield from `data_iter`, loading up to `depth` items ahead.
+    Metadata that informs how to work with a given set of integer labels.
     """
 
-    if depth < 0:
-        raise ValueError(f"{depth=} must be at least 0.")
-
-    if depth == 0:
-        yield from data_iter
-        return
-
-    loaded: queue.Queue = queue.Queue(maxsize=depth)
-    stop_event = threading.Event()
-    done_indicator = object()
-
-    def load() -> None:
-        try:
-            for item in data_iter:
-                while not stop_event.is_set():
-                    try:
-                        loaded.put(item, timeout=0.1)
-                        break
-                    except queue.Full:
-                        continue
-
-                if stop_event.is_set():
-                    return
-        except Exception as exc:  # noqa: BLE001
-            loaded.put(exc)
-        finally:
-            if not stop_event.is_set():
-                loaded.put(done_indicator)
-
-    thread = threading.Thread(target=load, daemon=True, name="data-prefetch")
-    thread.start()
-
-    try:
-        while True:
-            item = loaded.get()
-
-            if item is done_indicator:
-                return
-            if isinstance(item, Exception):
-                raise item
-
-            yield item
-    finally:
-        stop_event.set()
+    class_names: dict[int, str]  # Label value --> class name.
+    ignore_id: int = IGNORE_LABEL_ID  # Label value of ignored pixels.
+    eval_class_ids: frozenset[int]  # Classes trained & evaluated on.
+    class_colors: dict[int, tuple[int, int, int]]  # Label value --> RGB color.
 
 
 @dataclasses.dataclass
@@ -94,7 +55,7 @@ class _CityscapesFile:
     A Cityscapes file, identified by its name: <city>_<clip>_<frame>_<suffix>.
     """
 
-    FILE_NAME_PATTERN = re.compile(r"(?!)")  # matches nothing; see subclasses
+    FILE_NAME_PATTERN = re.compile(r"(?!)")  # Matches nothing.
 
     city: str
     clip_idx: str
@@ -166,7 +127,11 @@ class CityscapesDatapoint:
     image: _CityscapesImage
     label: _CityscapesLabel
 
-    def load(self) -> Self:
+    def loaded(self) -> Self:
+        """
+        Return a copy of this datapoint, with its image & label loaded.
+        """
+
         dp = CityscapesDatapoint(
             image=_CityscapesImage(self.image.path),
             label=_CityscapesLabel(self.label.path),
@@ -222,10 +187,12 @@ def _load_in_parallel(
     with ThreadPoolExecutor(
         max_workers=worker_count, thread_name_prefix="data-load"
     ) as pool:
-        pending: collections.deque[Future[T]] = collections.deque()
+        pending: collections.deque[Future[CityscapesDatapoint]] = (
+            collections.deque()
+        )
         try:
             for dp in datapoints:
-                pending.append(pool.submit(dp.load))
+                pending.append(pool.submit(dp.loaded))
                 if len(pending) >= 2 * worker_count:
                     yield pending.popleft().result()
 
@@ -242,6 +209,16 @@ class CityscapesLabeledDataset:
     """
 
     IS_OOS_SPLITS = ("train", "train_extra", "val", "test")
+
+    LABEL_METADATA = LabelMetadata(
+        class_names=CITYSCAPES_CLASS_NAMES,
+        eval_class_ids=frozenset(
+            class_id
+            for class_id, name in CITYSCAPES_CLASS_NAMES.items()
+            if name in CITYSCAPES_EVAL_CLASSES
+        ),
+        class_colors=CITYSCAPES_CLASS_COLORS,
+    )
 
     def _construct_datapoint_index(
         self, label_dir: str | Path
@@ -270,7 +247,7 @@ class CityscapesLabeledDataset:
 
             is_oos_split = label_path.relative_to(label_dir).parts[0]
             image = _CityscapesImage(
-                Path(self.image_dir)
+                self.image_dir
                 / is_oos_split
                 / label.city
                 / _CityscapesImage.get_path_name(
@@ -293,25 +270,25 @@ class CityscapesLabeledDataset:
         coarse_label_dir: str | Path = CITYSCAPES_DIR / "gtCoarse",
         seed: int = DEFAULT_SEED,
     ):
-        self.image_dir = image_dir
-        self.fine_label_dir = fine_label_dir
-        self.coarse_label_dir = coarse_label_dir
+        self.image_dir = Path(image_dir)
+        self.fine_label_dir = Path(fine_label_dir)
+        self.coarse_label_dir = Path(coarse_label_dir)
 
         self.seed = seed
 
         start = time.perf_counter()
         self.fine_datapoint_index = self._construct_datapoint_index(
-            fine_label_dir
+            self.fine_label_dir
         )
         self.coarse_datapoint_index = self._construct_datapoint_index(
-            coarse_label_dir
+            self.coarse_label_dir
         )
         logger.info(
             "Took %.2fs to index fine and coarse datapoints",
             time.perf_counter() - start,
         )
 
-    def get_fine_label_train_dataset(
+    def iter_fine_train_datapoints(
         self,
         num_datapoints: int | None = None,
         worker_count: int = DEFAULT_WORKER_COUNT,
@@ -348,7 +325,7 @@ class CityscapesLabeledDataset:
             worker_count,
         )
 
-    def _get_fine_label_val_datapoints(self) -> list[CityscapesDatapoint]:
+    def _get_fine_val_datapoints(self) -> list[CityscapesDatapoint]:
         return list(
             _get_cityscapes_datapoint_index_iter(
                 self.fine_datapoint_index,
@@ -356,23 +333,19 @@ class CityscapesLabeledDataset:
             )
         )
 
-    def get_fine_label_val_datapoint_count(self) -> int:
-        """Return the number of val datapoints, without loading any."""
+    def get_fine_val_datapoint_count(self) -> int:
+        return len(self._get_fine_val_datapoints())
 
-        return len(self._get_fine_label_val_datapoints())
-
-    def get_fine_label_val_dataset(
+    def iter_fine_val_datapoints(
         self,
         shuffle: bool = False,
         worker_count: int = DEFAULT_WORKER_COUNT,
     ) -> Iterator[CityscapesDatapoint]:
         """
         Return an iterator over val datapoints, in index order.
-
-        If `shuffle`, the order is instead a random permutation, from self.seed.
         """
 
-        datapoints = self._get_fine_label_val_datapoints()
+        datapoints = self._get_fine_val_datapoints()
         logger.info(
             f"There are {len(datapoints):} finely-labeled Cityscapes val "
             "datapoints"
@@ -387,27 +360,71 @@ class CityscapesLabeledDataset:
         yield from _load_in_parallel(datapoints, worker_count)
 
 
-def batch(
-    data_iter: Iterator[CityscapesDatapoint], batch_size: int
-) -> TensorDatapointIter:
+class CityscapesPersonLabeledDataset(CityscapesLabeledDataset):
     """
-    Yield uint8 (B, H, W, 3) image and (B, H, W) label batches.
-
-    Batches are pinned when CUDA is available, for async host-to-device copy.
+    Class to support accessing the "person" labeled Cityscapes dataset.
     """
 
-    pin = torch.cuda.is_available()
+    NEGATIVE_ID = 0
+    POSITIVE_ID = 1
+    IGNORE_ID = IGNORE_LABEL_ID
 
-    while datapoints := list(itertools.islice(data_iter, batch_size)):
-        image_batch = torch.from_numpy(
-            np.stack([dp.image.ary for dp in datapoints])
+    LABEL_METADATA = LabelMetadata(
+        class_names={NEGATIVE_ID: "background", POSITIVE_ID: "person"},
+        ignore_id=IGNORE_ID,
+        eval_class_ids=frozenset({NEGATIVE_ID, POSITIVE_ID}),
+        class_colors={
+            NEGATIVE_ID: (0, 0, 0),
+            POSITIVE_ID: CITYSCAPES_CLASS_COLORS[24],
+            IGNORE_ID: (128, 128, 128),
+        },
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # General Cityscapes class ID --> this dataset class ID.
+        self.label_map = np.full(
+            MAX_LABEL_COUNT, self.NEGATIVE_ID, dtype=np.uint8
         )
-        label_batch = torch.from_numpy(
-            np.stack([dp.label.ary for dp in datapoints])
+        for class_id, name in CITYSCAPES_CLASS_NAMES.items():
+            if name in CITYSCAPES_PERSON_CLASSES:
+                self.label_map[class_id] = self.POSITIVE_ID
+            elif name in CITYSCAPES_VOID_CLASSES:
+                self.label_map[class_id] = self.IGNORE_ID
+
+    def _to_these_labels(
+        self, datapoints: Iterator[CityscapesDatapoint]
+    ) -> Iterator[CityscapesDatapoint]:
+        """
+        Map the labels of loaded `datapoints` to this dataset's labels.
+        """
+
+        for dp in datapoints:
+            dp.label.ary = self.label_map[dp.label.ary]
+            yield dp
+
+    def iter_fine_train_datapoints(
+        self,
+        num_datapoints: int | None = None,
+        worker_count: int = DEFAULT_WORKER_COUNT,
+    ) -> Iterator[CityscapesDatapoint]:
+        return self._to_these_labels(
+            super().iter_fine_train_datapoints(num_datapoints, worker_count)
         )
 
-        if pin:
-            image_batch = image_batch.pin_memory()
-            label_batch = label_batch.pin_memory()
+    def iter_fine_val_datapoints(
+        self,
+        shuffle: bool = False,
+        worker_count: int = DEFAULT_WORKER_COUNT,
+    ) -> Iterator[CityscapesDatapoint]:
+        return self._to_these_labels(
+            super().iter_fine_val_datapoints(shuffle, worker_count)
+        )
 
-        yield image_batch, label_batch
+
+# Dataset class name --> class.
+CITYSCAPES_DATASET_CLASSES: dict[str, type[CityscapesLabeledDataset]] = {
+    cls.__name__: cls
+    for cls in (CityscapesLabeledDataset, CityscapesPersonLabeledDataset)
+}

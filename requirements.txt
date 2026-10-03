@@ -12,7 +12,7 @@ tensorboard==2.21.0
 nvidia-ml-py==13.610.43
 
 # Installed editable for local development:
-#   pip install -e /mnt/hdd1/projects/mini-profiler
+#   pip install -e ../mini-profiler
 mini-profiler @ git+https://github.com/skeselj/mini-profiler.git@main
 
 matplotlib==3.11.2
