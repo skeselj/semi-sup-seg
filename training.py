@@ -39,13 +39,16 @@ from constants import (
     MAX_PIXEL_INT_VALUE,
 )
 from data import (
-    CityscapesDatapoint,
+    CityscapesLabeledDatapoint,
     CityscapesLabeledDataset,
     CityscapesPersonLabeledDataset,
+    CityscapesUnlabeledDatapoint,
+    CityscapesUnlabeledDataset,
     LabelMetadata,
 )
 from data_aug import Augmentation, AugmentationSampler
-from data_iter import TensorDatapointIter, batch, prefetch
+from data_iter import TensorDatapointIter, batch, batch_images, prefetch
+from inference import PseudoLabeller
 from metrics import (
     compute_public_benchmark_metrics,
     get_batch_confusion_matrix,
@@ -274,33 +277,58 @@ class Trainer:
 
     def __init__(
         self,
+        *,
+        # Raw data.
         image_height: int,
         image_width: int,
-        train_data_iter: Iterator[CityscapesDatapoint],
-        val_data_iter: Iterator[CityscapesDatapoint],
+        train_data_iter: Iterator[CityscapesLabeledDatapoint],
+        val_data_iter: Iterator[CityscapesLabeledDatapoint],
+        label_metadata: LabelMetadata,
+        unlabeled_train_data_iter: (
+            Iterator[CityscapesUnlabeledDatapoint] | None
+        ) = None,
+        labeled_to_unlabeled_ratio: tuple[int, int] = (1, 7),
+        # Data transformation.
+        train_downscale: int = DEFAULT_TRAIN_DOWNSCALE,
+        pseudo_labeller: PseudoLabeller | None = None,
+        warmup_datapoints_before_pseudo_labeling: int = 0,
+        teacher_lag: int = 0,
+        teacher_ignore_range: tuple[float, float] = (0.0, 0.0),
+        augmentation_sampler: AugmentationSampler | None = None,
+        # Other.
         train_batch_size: int,
         val_batch_size: int,
-        label_metadata: LabelMetadata,
-        log_dir: Path | None,
         loss_fn: Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor],
-        augmentation_sampler: AugmentationSampler | None = None,
-        train_downscale: int = DEFAULT_TRAIN_DOWNSCALE,
         mixed_precision: bool = DEFAULT_MIXED_PRECISION,
+        log_dir: Path | None = None,
         checkpoint_metadata: dict[str, Any] | None = None,
     ):
         self.image_height = image_height
         self.image_width = image_width
         self.train_data_iter = train_data_iter
         self.val_data_iter = val_data_iter
+        self.label_metadata = label_metadata
+        self.unlabeled_train_data_iter = unlabeled_train_data_iter
+        self.labeled_to_unlabeled_ratio = labeled_to_unlabeled_ratio
+
+        self.train_downscale = train_downscale
+        self.pseudo_labeller = pseudo_labeller
+        self.warmup_datapoints_before_pseudo_labeling = (
+            warmup_datapoints_before_pseudo_labeling
+        )
+        self.teacher_lag = teacher_lag
+        self.teacher_ignore_range = teacher_ignore_range
+        self.augmentation_sampler = augmentation_sampler
+
         self.train_batch_size = train_batch_size
         self.val_batch_size = val_batch_size
-        self.label_metadata = label_metadata
-        self.log_dir = log_dir
         self.loss_fn = loss_fn
-        self.augmentation_sampler = augmentation_sampler
-        self.train_downscale = train_downscale
         self.mixed_precision = mixed_precision
+        self.log_dir = log_dir
         self.checkpoint_metadata = checkpoint_metadata or {}
+
+        if pseudo_labeller is not None and unlabeled_train_data_iter is None:
+            raise ValueError("Pseudo-labeling needs unlabeled train data.")
 
         # Raw label --> training label.
         self.label_map = torch.full(
@@ -314,6 +342,11 @@ class Trainer:
         self.grad_scaler = torch.amp.GradScaler(
             "cuda", enabled=mixed_precision and torch.cuda.is_available()
         )
+
+        # Train datapoints seen --> CPU copy of the model's state at that point.
+        self.teacher_candidate_states: dict[int, dict[str, torch.Tensor]] = {}
+        # Train datapoints seen when the teacher's state was checkpointed.
+        self.teacher_datapoints_seen: int | None = None
 
         self.training_logger = TrainingLogger(
             log_dir=log_dir, label_metadata=label_metadata
@@ -329,10 +362,6 @@ class Trainer:
     ) -> None:
         """
         Save model & optimizer state under `self.log_dir`, if it is set.
-
-        The file name holds `datapoints_seen`, the train datapoints seen so far.
-        The metadata holds it too, along with `val_metrics` from validating the
-        model as saved, if it was validated.
         """
 
         if self.log_dir is None:
@@ -351,14 +380,72 @@ class Trainer:
                     **self.checkpoint_metadata,
                     "datapoints_seen": datapoints_seen,
                     "val_metrics": val_metrics,
+                    "teacher_datapoints_seen": self.teacher_datapoints_seen,
                 },
             )
 
         logger.info(f"Saved checkpoint to '{path}'.")
 
+    def _update_teacher(self, model: nn.Module, datapoints_seen: int) -> None:
+        """
+        Keep the model's current state, as a candidate to be the teacher.
+        """
+
+        if self.pseudo_labeller is None:
+            return
+
+        self.teacher_candidate_states[datapoints_seen] = {
+            name: tensor.detach().to("cpu", copy=True)
+            for name, tensor in model.state_dict().items()
+        }
+
+        teacher_datapoints_seen = max(
+            (
+                candidate
+                for candidate in self.teacher_candidate_states
+                if candidate <= datapoints_seen - self.teacher_lag
+            ),
+            default=None,
+        )
+        if teacher_datapoints_seen is None:
+            return
+
+        # Older states can't be the teacher anymore.
+        for candidate in list(self.teacher_candidate_states):
+            if candidate < teacher_datapoints_seen:
+                del self.teacher_candidate_states[candidate]
+
+        if (
+            datapoints_seen < self.warmup_datapoints_before_pseudo_labeling
+            or teacher_datapoints_seen == self.teacher_datapoints_seen
+        ):
+            return
+
+        self.pseudo_labeller.model.load_state_dict(
+            self.teacher_candidate_states[teacher_datapoints_seen]
+        )
+        self.teacher_datapoints_seen = teacher_datapoints_seen
+        logger.info(
+            "Teacher is now the model after "
+            f"{teacher_datapoints_seen:,} train datapoints."
+        )
+
+    def _get_mixed_batch_sizes(self) -> tuple[int, int]:
+        """
+        Get the human-labeled & unlabeled counts in a pseudo-labeling batch.
+        """
+
+        labeled_part, unlabeled_part = self.labeled_to_unlabeled_ratio
+        labeled_batch_size = (
+            self.train_batch_size
+            * labeled_part
+            // (labeled_part + unlabeled_part)
+        )
+        return labeled_batch_size, self.train_batch_size - labeled_batch_size
+
     def _iterate_data(
         self,
-        data_iter: Iterator[CityscapesDatapoint],
+        data_iter: Iterator[CityscapesLabeledDatapoint],
         datapoint_count: int,
         batch_size: int,
     ) -> TensorDatapointIter:
@@ -393,15 +480,103 @@ class Trainer:
             f"Requested {datapoint_count:,}."
         )
 
-    def _iterate_train_data(self, datapoint_count: int) -> TensorDatapointIter:
-        return self._iterate_data(
-            self.train_data_iter, datapoint_count, self.train_batch_size
+    def _iterate_unlabeled_train_data(
+        self, datapoint_count: int, batch_size: int
+    ) -> Iterator[torch.Tensor]:
+        """
+        Yield unlabeled image batches, `datapoint_count` datapoints in total.
+        """
+
+        iterator = prefetch(
+            batch_images(
+                itertools.islice(
+                    self.unlabeled_train_data_iter, datapoint_count
+                ),
+                batch_size,
+            )
         )
+
+        while True:
+            with profiler.phase("load raw unlabeled data"):
+                image_batch = next(iterator, None)
+
+            if image_batch is None:
+                return
+
+            yield image_batch
+
+    def _iterate_train_data(
+        self, datapoint_count: int
+    ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]:
+        """
+        Yield (image, label, unlabeled image) train batches.
+
+        Unlabeled image batches are None until pseudo-labeling starts.
+        Labeled & unlabeled datapoints both count towards `datapoint_count`.
+        """
+
+        warmup_datapoint_count = datapoint_count
+        if self.pseudo_labeller is not None:
+            warmup_datapoint_count = min(
+                datapoint_count, self.warmup_datapoints_before_pseudo_labeling
+            )
+
+        for image_batch, label_batch in self._iterate_data(
+            self.train_data_iter, warmup_datapoint_count, self.train_batch_size
+        ):
+            yield image_batch, label_batch, None
+
+        mixed_batch_count = (
+            datapoint_count - warmup_datapoint_count
+        ) // self.train_batch_size
+        if mixed_batch_count == 0:
+            return
+
+        labeled_batch_size, unlabeled_batch_size = self._get_mixed_batch_sizes()
+        labeled_batches = self._iterate_data(
+            self.train_data_iter,
+            mixed_batch_count * labeled_batch_size,
+            labeled_batch_size,
+        )
+        unlabeled_batches = self._iterate_unlabeled_train_data(
+            mixed_batch_count * unlabeled_batch_size, unlabeled_batch_size
+        )
+        for (image_batch, label_batch), unlabeled_image_batch in zip(
+            labeled_batches, unlabeled_batches, strict=True
+        ):
+            yield image_batch, label_batch, unlabeled_image_batch
 
     def _iterate_val_data(self, datapoint_count: int) -> TensorDatapointIter:
         return self._iterate_data(
             self.val_data_iter, datapoint_count, self.val_batch_size
         )
+
+    @staticmethod
+    def _to_images(
+        image_batch: torch.Tensor, device: torch.device, downscale: int = 1
+    ) -> torch.Tensor:
+        """
+        Convert a uint8 image batch to model-ready images on device.
+
+        Images are downscaled by `downscale`, to the size labels are.
+        """
+
+        # uint8 (B, H, W, 3) --> float (B, 3, H / dscale, W / dscale) in [0, 1].
+        images = image_batch.to(device, non_blocking=True)
+        images = images.permute(0, 3, 1, 2).float() / MAX_PIXEL_INT_VALUE
+        if downscale != 1:
+            images = F.interpolate(
+                images,
+                # The size of `[::downscale, ::downscale]` slices.
+                size=(
+                    math.ceil(images.shape[-2] / downscale),
+                    math.ceil(images.shape[-1] / downscale),
+                ),
+                mode="bilinear",
+                antialias=True,
+            )
+
+        return images
 
     def _to_tensors(
         self,
@@ -424,32 +599,47 @@ class Trainer:
             self.label_map = self.label_map.to(device)
         labels = self.label_map[labels.int()]
 
-        # uint8 (B, H, W, 3) --> float (B, 3, H / dscale, W / dscale) in [0, 1].
-        images = image_batch.to(device, non_blocking=True)
-        images = images.permute(0, 3, 1, 2).float() / MAX_PIXEL_INT_VALUE
-        if downscale != 1:
-            images = F.interpolate(
-                images,
-                size=labels.shape[-2:],
-                mode="bilinear",
-                antialias=True,
-            )
+        images = self._to_images(image_batch, device, downscale)
 
         return images, labels
+
+    def _pseudo_label(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        Label images with the teacher, ignoring labels in the ignore range.
+        """
+
+        labels, confidences = self.pseudo_labeller.predict(images)
+
+        low, high = self.teacher_ignore_range
+        is_ignored = (confidences >= low) & (confidences < high)
+
+        return labels.masked_fill(is_ignored, self.label_metadata.ignore_id)
 
     def _to_train_tensors(
         self,
         image_batch: torch.Tensor,
         label_batch: torch.Tensor,
         device: torch.device,
+        unlabeled_image_batch: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, Augmentation | None]:
         """
         Like `_to_tensors`, but downscaled and potentially augmented.
+
+        If `unlabeled_image_batch` is set, it's pseudo-labeled & appended.
+        Pseudo-labeling happens before augmentation, so the teacher sees
+        un-augmented images.
         """
 
         images, labels = self._to_tensors(
             image_batch, label_batch, device, downscale=self.train_downscale
         )
+        if unlabeled_image_batch is not None:
+            unlabeled_images = self._to_images(
+                unlabeled_image_batch, device, downscale=self.train_downscale
+            )
+            images = torch.cat([images, unlabeled_images])
+            labels = torch.cat([labels, self._pseudo_label(unlabeled_images)])
+
         if self.augmentation_sampler is None:
             return images, labels, None
 
@@ -485,13 +675,14 @@ class Trainer:
         image_batch: torch.Tensor,
         label_batch: torch.Tensor,
         device: torch.device,
+        unlabeled_image_batch: torch.Tensor | None = None,
     ) -> None:
         """
         Evaluate on a batch, do the backward pass, but do not update model.
         """
 
         images, labels, _ = self._to_train_tensors(
-            image_batch, label_batch, device
+            image_batch, label_batch, device, unlabeled_image_batch
         )
         with autocast(device, self.mixed_precision):
             loss = self._loss(model(images), labels)
@@ -506,6 +697,7 @@ class Trainer:
         label_batch: torch.Tensor,
         optimizer: torch.optim.Optimizer,
         device: torch.device,
+        unlabeled_image_batch: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -520,7 +712,7 @@ class Trainer:
         """
 
         images, labels, augmentation = self._to_train_tensors(
-            image_batch, label_batch, device
+            image_batch, label_batch, device, unlabeled_image_batch
         )
         with autocast(device, self.mixed_precision):
             logits = model(images)
@@ -623,6 +815,27 @@ class Trainer:
             model.train()
             self._warm_up_step(model, *train_batch, device)
 
+            if self.pseudo_labeller is not None:
+                labeled_batch_size, unlabeled_batch_size = (
+                    self._get_mixed_batch_sizes()
+                )
+                self._warm_up_step(
+                    model,
+                    *_get_synthetic_batch(
+                        labeled_batch_size,
+                        self.image_height,
+                        self.image_width,
+                        label_id,
+                    ),
+                    device,
+                    unlabeled_image_batch=_get_synthetic_batch(
+                        unlabeled_batch_size,
+                        self.image_height,
+                        self.image_width,
+                        label_id,
+                    )[0],
+                )
+
             model.eval()
             self._val_step(model, *val_batch, device)
         finally:
@@ -668,12 +881,15 @@ class Trainer:
                 val_metrics=val_metrics,
             )
             datapoints_seen_at_last_checkpoint = 0
+            self._update_teacher(model, datapoints_seen=0)
             time_of_last_log = time.perf_counter()
 
             with torch_profile() as end_torch_profile_step:
-                for image_batch, label_batch in self._iterate_train_data(
-                    train_datapoint_count
-                ):
+                for (
+                    image_batch,
+                    label_batch,
+                    unlabeled_image_batch,
+                ) in self._iterate_train_data(train_datapoint_count):
                     with profiler.phase("infer on train batch", on_gpu=True):
                         images, labels, logits, loss, augmentation = (
                             self._train_step(
@@ -682,6 +898,7 @@ class Trainer:
                                 label_batch,
                                 optimizer,
                                 device,
+                                unlabeled_image_batch,
                             )
                         )
 
@@ -751,6 +968,7 @@ class Trainer:
                         val_metrics=val_metrics,
                     )
                     datapoints_seen_at_last_checkpoint = datapoints_seen
+                    self._update_teacher(model, datapoints_seen)
 
                     loss_sum_since_last_log.zero_()
                     augmentations_since_last_log.clear()
@@ -779,7 +997,15 @@ class TrainingConfig:
     Relevant settings of a training.
     """
 
-    dataset_class: type[CityscapesLabeledDataset]
+    labeled_dataset_class: type[CityscapesLabeledDataset]
+    unlabeled_dataset_class: type[CityscapesUnlabeledDataset]
+    labeled_to_unlabeled_ratio: tuple[int, int] = (1, 7)
+
+    do_pseudo_labeling: bool = False
+    warmup_datapoints_before_pseudo_labeling: int = 300_000
+    teacher_lag: int = 10_000
+    teacher_ignore_range: tuple[float, float] = (0.4, 0.6)
+
     train_datapoint_count: int
     val_datapoint_count: int | None
     train_batch_size: int
@@ -811,10 +1037,42 @@ class TrainingConfig:
             f"{self.loss_fn_name=} isn't a function in metrics.py."
         )
 
+        if not self.do_pseudo_labeling:
+            return
+
+        assert (
+            self.train_batch_size % sum(self.labeled_to_unlabeled_ratio) == 0
+        ), (
+            f"{sum(self.labeled_to_unlabeled_ratio)=} must divide "
+            f"{self.train_batch_size=}."
+        )
+        assert self.train_datapoint_count % self.train_batch_size == 0, (
+            f"{self.train_batch_size=} must divide "
+            f"{self.train_datapoint_count=}."
+        )
+        for name in ("warmup_datapoints_before_pseudo_labeling", "teacher_lag"):
+            assert getattr(self, name) % self.log_every_n_datapoints == 0, (
+                f"{self.log_every_n_datapoints=} must divide "
+                f"{name}={getattr(self, name)}."
+            )
+        assert (
+            0
+            <= self.teacher_lag
+            <= self.warmup_datapoints_before_pseudo_labeling
+        ), (
+            f"{self.teacher_lag=} must be in "
+            f"[0, {self.warmup_datapoints_before_pseudo_labeling=}]."
+        )
+        low, high = self.teacher_ignore_range
+        assert 0 <= low <= high <= 1, (
+            f"{self.teacher_ignore_range=} must be in [0, 1], low to high."
+        )
+
     def to_dict(self) -> dict[str, Any]:
         ret = dataclasses.asdict(self)
 
-        ret["dataset_class"] = self.dataset_class.__name__
+        for name in ("labeled_dataset_class", "unlabeled_dataset_class"):
+            ret[name] = getattr(self, name).__name__
         for name in ("init_checkpoint_path", "log_dir"):
             if ret[name] is not None:
                 ret[name] = str(ret[name])
@@ -880,7 +1138,7 @@ def train_unet_on_cityscapes(config: TrainingConfig) -> UNet:
     # Input shapes are fixed, so let cuDNN time & cache the fastest algorithms.
     torch.backends.cudnn.benchmark = True
 
-    dataset = config.dataset_class(seed=config.seed)
+    dataset = config.labeled_dataset_class(seed=config.seed)
     label_metadata = dataset.LABEL_METADATA
     train_data_iter = dataset.iter_fine_train_datapoints(
         num_datapoints=config.train_datapoint_count
@@ -933,6 +1191,25 @@ def train_unet_on_cityscapes(config: TrainingConfig) -> UNet:
                 model.parameters(), lr=config.learning_rate
             )
 
+            pseudo_labeller, unlabeled_train_data_iter = None, None
+            if config.do_pseudo_labeling:
+                # Its weights are set from the model's, once training starts.
+                teacher = UNet(**unet_config).to(device)
+                if os.environ.get("COMPILE_MODEL", "1") != "0":
+                    teacher.compile()
+                pseudo_labeller = PseudoLabeller(teacher, label_metadata)
+
+                unlabeled_dataset = config.unlabeled_dataset_class(
+                    seed=config.seed
+                )
+                # Index now, not when pseudo-labeling starts mid-training.
+                _ = unlabeled_dataset.image_index
+                unlabeled_train_data_iter = (
+                    unlabeled_dataset.iter_train_datapoints(
+                        num_datapoints=config.train_datapoint_count
+                    )
+                )
+
         trainer = Trainer(
             image_height=CITYSCAPES_IMAGE_HEIGHT,
             image_width=CITYSCAPES_IMAGE_WIDTH,
@@ -945,6 +1222,14 @@ def train_unet_on_cityscapes(config: TrainingConfig) -> UNet:
             loss_fn=getattr(metrics, config.loss_fn_name),
             augmentation_sampler=config.augmentation_sampler,
             checkpoint_metadata=checkpoint_metadata,
+            pseudo_labeller=pseudo_labeller,
+            unlabeled_train_data_iter=unlabeled_train_data_iter,
+            labeled_to_unlabeled_ratio=config.labeled_to_unlabeled_ratio,
+            warmup_datapoints_before_pseudo_labeling=(
+                config.warmup_datapoints_before_pseudo_labeling
+            ),
+            teacher_lag=config.teacher_lag,
+            teacher_ignore_range=config.teacher_ignore_range,
         )
 
         with profiler.phase("warm up", on_gpu=True):
@@ -975,8 +1260,10 @@ if __name__ == "__main__":
     start_time = datetime.now().astimezone()
     train_unet_on_cityscapes(
         TrainingConfig(
-            dataset_class=CityscapesPersonLabeledDataset,
-            train_datapoint_count=300_000,  # About 100 epochs of the ~2,975 finely labeled training datapoints.
+            labeled_dataset_class=CityscapesPersonLabeledDataset,
+            unlabeled_dataset_class=CityscapesUnlabeledDataset,
+            do_pseudo_labeling=True,
+            train_datapoint_count=3_000_000,
             val_datapoint_count=None,  # Use all 500 labeled datapoints each time.
             train_batch_size=8,
             val_batch_size=1,

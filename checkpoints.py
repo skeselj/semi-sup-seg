@@ -115,4 +115,4 @@ def get_checkpoint_dataset_name(checkpoint: dict[str, Any]) -> str:
     Get the class name of the dataset `checkpoint` was trained on.
     """
 
-    return checkpoint["metadata"]["training_config"]["dataset_class"]
+    return checkpoint["metadata"]["training_config"]["labeled_dataset_class"]

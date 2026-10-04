@@ -11,7 +11,7 @@ from typing import TypeVar
 import numpy as np
 import torch
 
-from data import CityscapesDatapoint
+from data import CityscapesLabeledDatapoint, CityscapesUnlabeledDatapoint
 
 DEFAULT_PREFETCH_DEPTH = 16
 
@@ -73,7 +73,7 @@ def prefetch(
 
 
 def batch(
-    data_iter: Iterator[CityscapesDatapoint], batch_size: int
+    data_iter: Iterator[CityscapesLabeledDatapoint], batch_size: int
 ) -> TensorDatapointIter:
     """
     Yield uint8 (B, H, W, 3) image and (B, H, W) label batches.
@@ -96,3 +96,25 @@ def batch(
             label_batch = label_batch.pin_memory()
 
         yield image_batch, label_batch
+
+
+def batch_images(
+    data_iter: Iterator[CityscapesUnlabeledDatapoint], batch_size: int
+) -> Iterator[torch.Tensor]:
+    """
+    Yield uint8 (B, H, W, 3) image batches, ignoring any labels.
+
+    Batches are pinned when CUDA is available, for async host-to-device copy.
+    """
+
+    pin = torch.cuda.is_available()
+
+    while datapoints := list(itertools.islice(data_iter, batch_size)):
+        image_batch = torch.from_numpy(
+            np.stack([dp.image.ary for dp in datapoints])
+        )
+
+        if pin:
+            image_batch = image_batch.pin_memory()
+
+        yield image_batch

@@ -4,6 +4,7 @@ Module to support accessing semantic segmentation data.
 
 import collections
 import dataclasses
+import functools
 import itertools
 import logging
 import re
@@ -11,7 +12,7 @@ import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Literal, Self
+from typing import Literal, Self, TypeVar
 
 import numpy as np
 from PIL import Image
@@ -123,8 +124,23 @@ class _CityscapesLabel(_CityscapesFile):
 
 
 @dataclasses.dataclass
-class CityscapesDatapoint:
+class CityscapesUnlabeledDatapoint:
     image: _CityscapesImage
+
+    def loaded(self) -> Self:
+        """
+        Return a copy of this datapoint, with its image loaded.
+        """
+
+        dp = CityscapesUnlabeledDatapoint(
+            image=_CityscapesImage(self.image.path)
+        )
+        dp.image.load()
+        return dp
+
+
+@dataclasses.dataclass
+class CityscapesLabeledDatapoint(CityscapesUnlabeledDatapoint):
     label: _CityscapesLabel
 
     def loaded(self) -> Self:
@@ -132,7 +148,7 @@ class CityscapesDatapoint:
         Return a copy of this datapoint, with its image & label loaded.
         """
 
-        dp = CityscapesDatapoint(
+        dp = CityscapesLabeledDatapoint(
             image=_CityscapesImage(self.image.path),
             label=_CityscapesLabel(self.label.path),
         )
@@ -141,7 +157,9 @@ class CityscapesDatapoint:
         return dp
 
 
-_CityscapesDatapointIndex = dict[
+_DatapointT = TypeVar("_DatapointT", bound=CityscapesUnlabeledDatapoint)
+
+_CityscapesIndex = dict[
     # IS-OOS split, (e.g. "train_extra") -->
     str,
     dict[
@@ -149,16 +167,33 @@ _CityscapesDatapointIndex = dict[
         str,
         dict[
             # clip index (e.g. "000050") --> datapoints
-            str, list[CityscapesDatapoint]
+            str, list[_DatapointT]
         ],
     ],
 ]
+_CityscapesUnlabeledDatapointIndex = _CityscapesIndex[
+    CityscapesUnlabeledDatapoint
+]
+_CityscapesLabeledDatapointIndex = _CityscapesIndex[CityscapesLabeledDatapoint]
+
+
+def _get_empty_index() -> _CityscapesIndex:
+    return (
+        # IS-OOS split --> ...
+        collections.defaultdict(
+            # city --> ...
+            lambda: collections.defaultdict(
+                # clip index --> datapoints
+                lambda: collections.defaultdict(list)
+            )
+        )
+    )
 
 
 def _get_cityscapes_datapoint_index_iter(
-    datapoint_index: _CityscapesDatapointIndex,
+    datapoint_index: _CityscapesIndex[_DatapointT],
     selected_is_oos_splits: list[str] | None = None,
-) -> Iterator[CityscapesDatapoint]:
+) -> Iterator[_DatapointT]:
     """
     Get iterator over datapoints in datapoint index.
     """
@@ -173,10 +208,28 @@ def _get_cityscapes_datapoint_index_iter(
                 yield from split_index[city][clip_idx]
 
 
+def _iter_shuffled(
+    items: list[_DatapointT], rng: np.random.Generator, count: int
+) -> Iterator[_DatapointT]:
+    """
+    Yield `count` of `items`, reshuffling `items` after each pass over them.
+    """
+
+    if not items and count > 0:
+        raise ValueError(f"Can't yield {count:,} items from no items.")
+
+    def shuffled_idxs_gen() -> Iterator[int]:
+        while True:
+            yield from rng.permutation(len(items))
+
+    for i in itertools.islice(shuffled_idxs_gen(), count):
+        yield items[i]
+
+
 def _load_in_parallel(
-    datapoints: Iterable[CityscapesDatapoint],
+    datapoints: Iterable[_DatapointT],
     worker_count: int = DEFAULT_WORKER_COUNT,
-) -> Iterator[CityscapesDatapoint]:
+) -> Iterator[_DatapointT]:
     """
     Yield loaded copies of `datapoints`, in order, with worker count threads.
     """
@@ -187,9 +240,7 @@ def _load_in_parallel(
     with ThreadPoolExecutor(
         max_workers=worker_count, thread_name_prefix="data-load"
     ) as pool:
-        pending: collections.deque[Future[CityscapesDatapoint]] = (
-            collections.deque()
-        )
+        pending: collections.deque[Future[_DatapointT]] = collections.deque()
         try:
             for dp in datapoints:
                 pending.append(pool.submit(dp.loaded))
@@ -203,11 +254,79 @@ def _load_in_parallel(
                 future.cancel()
 
 
-class CityscapesDataset:
-    pass
+class CityscapesUnlabeledDataset:
+    """
+    Class to support accessing Cityscapes images, ignoring any labels.
+    """
+
+    def __init__(
+        self,
+        image_dir: str | Path = CITYSCAPES_DIR / "leftImg8bit_sequence",
+        seed: int = DEFAULT_SEED,
+    ):
+        self.image_dir = Path(image_dir)
+        self.seed = seed
+
+    @functools.cached_property
+    def image_index(self) -> _CityscapesUnlabeledDatapointIndex:
+        """
+        Index of the images in `self.image_dir`, built on first access.
+        """
+
+        start = time.perf_counter()
+
+        ret = _get_empty_index()
+        for image_path in sorted(self.image_dir.rglob("*")):
+            if not image_path.is_file():
+                continue
+
+            try:
+                image = _CityscapesImage(image_path)
+            except InvalidPathException:
+                continue
+
+            is_oos_split = image_path.relative_to(self.image_dir).parts[0]
+            ret[is_oos_split][image.city][image.clip_idx].append(
+                CityscapesUnlabeledDatapoint(image=image)
+            )
+
+        logger.info(
+            "Took %.2fs to index images in '%s'",
+            time.perf_counter() - start,
+            self.image_dir,
+        )
+        return ret
+
+    def iter_train_datapoints(
+        self,
+        num_datapoints: int | None = None,
+        worker_count: int = DEFAULT_WORKER_COUNT,
+    ) -> Iterator[CityscapesUnlabeledDatapoint]:
+        """
+        Return an iterator over unlabeled datapoints, in random order.
+        """
+
+        rng = np.random.default_rng(self.seed)
+
+        datapoints = list(
+            _get_cityscapes_datapoint_index_iter(
+                self.image_index, selected_is_oos_splits=["train"]
+            )
+        )
+        logger.info(
+            f"There are {len(datapoints):,} unique unlabeled Cityscapes "
+            "train datapoints"
+        )
+
+        if num_datapoints is None:
+            num_datapoints = len(datapoints)
+
+        yield from _load_in_parallel(
+            _iter_shuffled(datapoints, rng, num_datapoints), worker_count
+        )
 
 
-class CityscapesLabeledDataset:
+class CityscapesLabeledDataset(CityscapesUnlabeledDataset):
     """
     Class to support accessing the labeled Cityscapes dataset.
     """
@@ -224,22 +343,29 @@ class CityscapesLabeledDataset:
         class_colors=CITYSCAPES_CLASS_COLORS,
     )
 
+    def __init__(
+        self,
+        image_dir: str | Path = CITYSCAPES_DIR / "leftImg8bit",
+        fine_label_dir: str | Path = CITYSCAPES_DIR / "gtFine",
+        coarse_label_dir: str | Path = CITYSCAPES_DIR / "gtCoarse",
+        seed: int = DEFAULT_SEED,
+    ):
+        super().__init__(image_dir=image_dir, seed=seed)
+
+        self.fine_label_dir = Path(fine_label_dir)
+        self.coarse_label_dir = Path(coarse_label_dir)
+
     def _construct_datapoint_index(
         self, label_dir: str | Path
-    ) -> _CityscapesDatapointIndex:
+    ) -> _CityscapesLabeledDatapointIndex:
+        """
+        Index of the datapoints in `label_dir`.
+        """
+
         label_dir = Path(label_dir)
+        start = time.perf_counter()
 
-        ret = (
-            # IS-OOS split --> ...
-            collections.defaultdict(
-                # city --> ...
-                lambda: collections.defaultdict(
-                    # clip index --> datapoints
-                    lambda: collections.defaultdict(list)
-                )
-            )
-        )
-
+        ret = _get_empty_index()
         for label_path in sorted(label_dir.rglob("*")):
             if not label_path.is_file():
                 continue
@@ -262,41 +388,37 @@ class CityscapesLabeledDataset:
             )
 
             ret[is_oos_split][label.city][label.clip_idx].append(
-                CityscapesDatapoint(image=image, label=label)
+                CityscapesLabeledDatapoint(image=image, label=label)
             )
 
+        logger.info(
+            "Took %.2fs to index datapoints in '%s'",
+            time.perf_counter() - start,
+            label_dir,
+        )
         return ret
 
-    def __init__(
-        self,
-        image_dir: str | Path = CITYSCAPES_DIR / "leftImg8bit",
-        fine_label_dir: str | Path = CITYSCAPES_DIR / "gtFine",
-        coarse_label_dir: str | Path = CITYSCAPES_DIR / "gtCoarse",
-        seed: int = DEFAULT_SEED,
-    ):
-        self.image_dir = Path(image_dir)
-        self.fine_label_dir = Path(fine_label_dir)
-        self.coarse_label_dir = Path(coarse_label_dir)
+    @functools.cached_property
+    def fine_datapoint_index(self) -> _CityscapesLabeledDatapointIndex:
+        """
+        Index of the finely labeled datapoints, built on first access.
+        """
 
-        self.seed = seed
+        return self._construct_datapoint_index(self.fine_label_dir)
 
-        start = time.perf_counter()
-        self.fine_datapoint_index = self._construct_datapoint_index(
-            self.fine_label_dir
-        )
-        self.coarse_datapoint_index = self._construct_datapoint_index(
-            self.coarse_label_dir
-        )
-        logger.info(
-            "Took %.2fs to index fine and coarse datapoints",
-            time.perf_counter() - start,
-        )
+    @functools.cached_property
+    def coarse_datapoint_index(self) -> _CityscapesLabeledDatapointIndex:
+        """
+        Index of the coarsely labeled datapoints, built on first access.
+        """
+
+        return self._construct_datapoint_index(self.coarse_label_dir)
 
     def iter_fine_train_datapoints(
         self,
         num_datapoints: int | None = None,
         worker_count: int = DEFAULT_WORKER_COUNT,
-    ) -> Iterator[CityscapesDatapoint]:
+    ) -> Iterator[CityscapesLabeledDatapoint]:
         """
         Return an iterator over train datapoints, in random order.
         """
@@ -317,19 +439,11 @@ class CityscapesLabeledDataset:
         if num_datapoints is None:
             num_datapoints = len(datapoints)
 
-        def shuffled_idxs_gen() -> Iterator[int]:
-            while True:
-                yield from rng.permutation(len(datapoints))
-
         yield from _load_in_parallel(
-            (
-                datapoints[i]
-                for i in itertools.islice(shuffled_idxs_gen(), num_datapoints)
-            ),
-            worker_count,
+            _iter_shuffled(datapoints, rng, num_datapoints), worker_count
         )
 
-    def _get_fine_val_datapoints(self) -> list[CityscapesDatapoint]:
+    def _get_fine_val_datapoints(self) -> list[CityscapesLabeledDatapoint]:
         return list(
             _get_cityscapes_datapoint_index_iter(
                 self.fine_datapoint_index,
@@ -344,7 +458,7 @@ class CityscapesLabeledDataset:
         self,
         shuffle: bool = False,
         worker_count: int = DEFAULT_WORKER_COUNT,
-    ) -> Iterator[CityscapesDatapoint]:
+    ) -> Iterator[CityscapesLabeledDatapoint]:
         """
         Return an iterator over val datapoints, in index order.
         """
@@ -398,8 +512,8 @@ class CityscapesPersonLabeledDataset(CityscapesLabeledDataset):
                 self.label_map[class_id] = self.IGNORE_ID
 
     def _to_these_labels(
-        self, datapoints: Iterator[CityscapesDatapoint]
-    ) -> Iterator[CityscapesDatapoint]:
+        self, datapoints: Iterator[CityscapesLabeledDatapoint]
+    ) -> Iterator[CityscapesLabeledDatapoint]:
         """
         Map the labels of loaded `datapoints` to this dataset's labels.
         """
@@ -412,7 +526,7 @@ class CityscapesPersonLabeledDataset(CityscapesLabeledDataset):
         self,
         num_datapoints: int | None = None,
         worker_count: int = DEFAULT_WORKER_COUNT,
-    ) -> Iterator[CityscapesDatapoint]:
+    ) -> Iterator[CityscapesLabeledDatapoint]:
         return self._to_these_labels(
             super().iter_fine_train_datapoints(num_datapoints, worker_count)
         )
@@ -421,7 +535,7 @@ class CityscapesPersonLabeledDataset(CityscapesLabeledDataset):
         self,
         shuffle: bool = False,
         worker_count: int = DEFAULT_WORKER_COUNT,
-    ) -> Iterator[CityscapesDatapoint]:
+    ) -> Iterator[CityscapesLabeledDatapoint]:
         return self._to_these_labels(
             super().iter_fine_val_datapoints(shuffle, worker_count)
         )
