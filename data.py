@@ -203,6 +203,10 @@ def _load_in_parallel(
                 future.cancel()
 
 
+class CityscapesDataset:
+    pass
+
+
 class CityscapesLabeledDataset:
     """
     Class to support accessing the labeled Cityscapes dataset.

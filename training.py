@@ -784,6 +784,10 @@ class TrainingConfig:
     val_datapoint_count: int | None
     train_batch_size: int
     val_batch_size: int
+
+    augmentation_sampler: AugmentationSampler | None = None
+
+    log_dir: Path | None = None
     log_every_n_datapoints: int
 
     init_checkpoint_path: Path | None = None
@@ -793,11 +797,8 @@ class TrainingConfig:
     base_channel_count: int | None = None
     level_count: int | None = None
 
-    learning_rate: float = 1e-4
     loss_fn_name: str = "cross_entropy"
-    augmentation_sampler: AugmentationSampler | None = None
-
-    log_dir: Path | None = None
+    learning_rate: float = 1e-4
 
     seed: int = DEFAULT_SEED
 
@@ -979,12 +980,12 @@ if __name__ == "__main__":
             val_datapoint_count=None,  # Use all 500 labeled datapoints each time.
             train_batch_size=8,
             val_batch_size=1,
-            init_checkpoint_path=None,
             augmentation_sampler=AugmentationSampler(),
-            log_every_n_datapoints=5_000,
+            init_checkpoint_path=None,
             log_dir=(
                 DEFAULT_RUNS_DIR
                 / f"{label}_unet_cityscapes_{start_time:%Y%m%d_%H%M%S}"
             ),
+            log_every_n_datapoints=5_000,
         )
     )
