@@ -7,10 +7,10 @@ import logging
 import torch
 from torch import nn
 
-from config import PseudoLabelingConfig
-from data.labels import LabelMetadata
-from models import UNet
-from precision import DEFAULT_MIXED_PRECISION, autocast
+from semi_sup_seg.config import PseudoLabelingConfig
+from semi_sup_seg.data.labels import LabelMetadata
+from semi_sup_seg.models import UNet
+from semi_sup_seg.precision import DEFAULT_MIXED_PRECISION, autocast
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +115,6 @@ class PseudoLabeler:
         """
 
         labels, confidences = self.predict(images)
-
         is_ignored = confidences <= self.config.teacher_min_confidence
 
         return labels.masked_fill(is_ignored, self.label_metadata.ignore_id)

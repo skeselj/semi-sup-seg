@@ -10,15 +10,15 @@ import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-from constants import MAX_LABEL_COUNT, MAX_PIXEL_INT_VALUE
-from data.aug import Augmentation
-from data.labels import LabelMetadata
+from semi_sup_seg.constants import MAX_LABEL_COUNT, MAX_PIXEL_INT_VALUE
+from semi_sup_seg.data.aug import Augmentation
+from semi_sup_seg.data.labels import LabelMetadata
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_LOG_EVERY_N = 500
 DEFAULT_LOG_IMAGE_COUNT = 2
-DEFAULT_LOG_IMAGE_DOWNSCALE = 4
+DEFAULT_LOG_IMAGE_DOWNSCALE = 2
 
 
 class TrainingLogger:
@@ -130,12 +130,14 @@ class TrainingLogger:
         self,
         datapoints_seen: int,
         total_datapoint_count: int,
-        loss: float,
+        loss_avg: float,
+        loss_stddev: float,
         metrics: dict[str, float],
     ) -> None:
         """
         Log core validation metrics.
 
+        `loss_avg` & `loss_stddev` are over the per-datapoint losses.
         `metrics` comes from `metrics.compute_public_benchmark_metrics`.
         """
 
@@ -145,7 +147,7 @@ class TrainingLogger:
                 [
                     "val logs:",
                     f"\t(train) datapoints seen: {datapoints_seen:,}/{total_datapoint_count:,}",
-                    f"\tloss: {loss:.4f}",
+                    f"\tloss: {loss_avg:.4f} avg, {loss_stddev:.4f} std. dev.",
                     f"\taccuracy: {metrics['accuracy']:.2%}",
                     f"\tmean IoU: {metrics['mean_iou']:.2%}",
                 ]
@@ -154,7 +156,10 @@ class TrainingLogger:
         # fmt: on
 
         if self.writer is not None:
-            self.writer.add_scalar("val/loss", loss, datapoints_seen)
+            self.writer.add_scalar("val/loss_avg", loss_avg, datapoints_seen)
+            self.writer.add_scalar(
+                "val/loss_stddev", loss_stddev, datapoints_seen
+            )
             for name, value in metrics.items():
                 if not math.isnan(value):
                     self.writer.add_scalar(

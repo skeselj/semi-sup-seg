@@ -2,7 +2,8 @@ from pathlib import Path
 
 # Begin general filesystem constants. ##########################################
 
-PROJECT_DIR = Path(__file__).resolve().parent
+# This file is <project>/src/semi_sup_seg/constants.py.
+PROJECT_DIR = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_DIR.parent / "data"
 
 DEFAULT_RUNS_DIR = PROJECT_DIR / "logs" / "runs"

@@ -16,12 +16,12 @@ from typing import Literal, TypeVar
 import numpy as np
 from PIL import Image
 
-from constants import CITYSCAPES_DIR, DEFAULT_SEED
-from data._iter import TensorDatapointIter as TensorDatapointIter
-from data._iter import batch as batch
-from data._iter import iter_shuffled
-from data._iter import prefetch as prefetch
-from data.labels import (
+from semi_sup_seg.constants import CITYSCAPES_DIR, DEFAULT_SEED
+from semi_sup_seg.data._iter import TensorDatapointIter as TensorDatapointIter
+from semi_sup_seg.data._iter import batch as batch
+from semi_sup_seg.data._iter import iter_shuffled
+from semi_sup_seg.data._iter import prefetch as prefetch
+from semi_sup_seg.data.labels import (
     CITYSCAPES_LABEL_METADATA,
     CITYSCAPES_PERSON_LABEL_METADATA,
 )
@@ -80,6 +80,10 @@ class _CityscapesImage(_CityscapesFile):
 
     def load(self) -> np.ndarray:
         return np.asarray(Image.open(self.path).convert("RGB"))
+
+    def get_size(self) -> tuple[int, int]:
+        width, height = Image.open(self.path).size
+        return height, width
 
 
 class _CityscapesLabel(_CityscapesFile):
@@ -198,7 +202,7 @@ def _build_index(
     return ret
 
 
-def _get_cityscapes_datapoint_index_iter(
+def get_cityscapes_datapoint_index_iter(
     datapoint_index: _CityscapesDatapointIndex[_DatapointT],
     selected_is_oos_splits: list[str] | None = None,
 ) -> Iterator[_DatapointT]:
@@ -277,9 +281,24 @@ class CityscapesUnlabeledDataset:
         self,
         image_dir: str | Path = CITYSCAPES_DIR / "leftImg8bit_sequence",
         seed: int = DEFAULT_SEED,
+        keep_every_nth_frame: int = 2,
     ):
+        """
+        Parameters
+        ----------
+            image_dir: root of the images, with one subdirectory per split.
+            seed: seed for the random order of train datapoints.
+            keep_every_nth_frame: train datapoints are frames 0, n, 2n, ... of
+                each clip. Nearby frames are near duplicates, and fewer frames
+                are likelier to fit in the OS's file cache.
+        """
+
+        if keep_every_nth_frame < 1:
+            raise ValueError(f"{keep_every_nth_frame=} must be at least 1.")
+
         self.image_dir = Path(image_dir)
         self.seed = seed
+        self.keep_every_nth_frame = keep_every_nth_frame
 
     @functools.cached_property
     def image_index(self) -> _CityscapesUnlabeledDatapointIndex:
@@ -294,6 +313,14 @@ class CityscapesUnlabeledDataset:
             ),
         )
 
+    def get_image_size(self) -> tuple[int, int]:
+        """
+        Get the (H, W) of the images, assuming they're all the same size.
+        """
+
+        dp = next(get_cityscapes_datapoint_index_iter(self.image_index))
+        return dp.image.get_size()
+
     def iter_train_datapoints(
         self,
         num_datapoints: int | None = None,
@@ -301,15 +328,22 @@ class CityscapesUnlabeledDataset:
     ) -> Iterator[tuple[np.ndarray]]:
         """
         Yield loaded (image,) train datapoints, in random order.
+
+        Only every `keep_every_nth_frame`-th frame of each clip is used.
         """
 
+        # Each clip's frames are in frame order, as the index is sorted.
+        datapoints = [
+            dp
+            for city_index in self.image_index.get("train", {}).values()
+            for clip_datapoints in city_index.values()
+            for dp in clip_datapoints[:: self.keep_every_nth_frame]
+        ]
+
         yield from _iter_loaded(
-            list(
-                _get_cityscapes_datapoint_index_iter(
-                    self.image_index, selected_is_oos_splits=["train"]
-                )
-            ),
-            "unique unlabeled Cityscapes train datapoints",
+            datapoints,
+            "unique unlabeled Cityscapes train datapoints (every "
+            f"{self.keep_every_nth_frame} frames per clip)",
             worker_count,
             rng=np.random.default_rng(self.seed),
             num_datapoints=num_datapoints,
@@ -321,7 +355,7 @@ class CityscapesLabeledDataset:
     Class to support accessing the labeled Cityscapes dataset.
     """
 
-    IS_OOS_SPLITS = ("train", "train_extra", "val", "test")
+    IS_OOS_SPLITS = ("train", "val")
     LABEL_METADATA = CITYSCAPES_LABEL_METADATA
 
     def __init__(
@@ -372,6 +406,16 @@ class CityscapesLabeledDataset:
 
         return _build_index(self.coarse_label_dir, self._to_datapoint)
 
+    def get_image_size(self) -> tuple[int, int]:
+        """
+        Get the (H, W) of the images & labels, assuming they're all the same.
+        """
+
+        dp = next(
+            get_cityscapes_datapoint_index_iter(self.fine_datapoint_index)
+        )
+        return dp.image.get_size()
+
     def iter_fine_train_datapoints(
         self,
         num_datapoints: int | None = None,
@@ -383,7 +427,7 @@ class CityscapesLabeledDataset:
 
         yield from _iter_loaded(
             list(
-                _get_cityscapes_datapoint_index_iter(
+                get_cityscapes_datapoint_index_iter(
                     self.fine_datapoint_index,
                     selected_is_oos_splits=["train"],
                 )
@@ -396,7 +440,7 @@ class CityscapesLabeledDataset:
 
     def _get_fine_val_datapoints(self) -> list[CityscapesLabeledDatapoint]:
         return list(
-            _get_cityscapes_datapoint_index_iter(
+            get_cityscapes_datapoint_index_iter(
                 self.fine_datapoint_index,
                 selected_is_oos_splits=["val"],
             )

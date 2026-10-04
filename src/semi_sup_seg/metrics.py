@@ -4,7 +4,7 @@ Module to support evaluating semantic segmentation models.
 
 import torch
 
-from data.labels import LabelMetadata
+from semi_sup_seg.data.labels import LabelMetadata
 
 
 def get_per_image_confusion_matrices(
@@ -82,15 +82,29 @@ def compute_public_benchmark_metrics(
     eval_rows = confusion[eval_ids].double()
     eval_block = eval_rows[:, eval_ids]
 
+    # Per class: pixels labeled & predicted as it, labeled as it, and
+    # predicted as it (among pixels labeled as an eval class).
     intersection = eval_block.diagonal()
-    union = eval_rows.sum(dim=1) + eval_block.sum(dim=0) - intersection
-    ious = intersection / union  # NaN for a class never seen
+    labeled = eval_rows.sum(dim=1)
+    predicted = eval_block.sum(dim=0)
+
+    # NaN for a class never labeled, or never labeled nor predicted.
+    ious = intersection / (labeled + predicted - intersection)
+    # NaN for a class never predicted.
+    precisions = intersection / predicted
+    # NaN for a class never labeled.
+    recalls = intersection / labeled
 
     metrics = {
         "accuracy": (intersection.sum() / eval_rows.sum()).item(),
         "mean_iou": torch.nanmean(ious).item(),
     }
-    for class_id, iou in zip(eval_ids, ious.tolist()):
-        metrics[f"iou/{label_metadata.class_names[class_id]}"] = iou
+    for name, values in [
+        ("iou", ious),
+        ("precision", precisions),
+        ("recall", recalls),
+    ]:
+        for class_id, value in zip(eval_ids, values.tolist()):
+            metrics[f"{name}/{label_metadata.class_names[class_id]}"] = value
 
     return metrics

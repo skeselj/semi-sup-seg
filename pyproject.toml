@@ -1,4 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "semi-sup-seg"
+version = "0.1.0"
+description = "Semi-supervised semantic segmentation of Cityscapes."
+requires-python = ">=3.11"
+# Dependencies are pinned in requirements.txt.
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.ruff]
 required-version = "0.16.6"
 target-version = "py311"
 line-length = 80
+# Where first-party code is, for import sorting.
+src = [".", "src"]

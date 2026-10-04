@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from profiler import torch_phase
 from torch import nn
 
-from constants import IMAGE_CHANNEL_COUNT, MAX_LABEL_COUNT
+from semi_sup_seg.constants import IMAGE_CHANNEL_COUNT, MAX_LABEL_COUNT
 
 logger = logging.getLogger(__name__)
 

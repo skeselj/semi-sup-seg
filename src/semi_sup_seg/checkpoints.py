@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from models import UNet
+from semi_sup_seg.models import UNet
 
 
 def _sha256(path: Path) -> str:

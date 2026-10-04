@@ -6,7 +6,7 @@ import dataclasses
 
 import torch
 
-from constants import (
+from semi_sup_seg.constants import (
     CITYSCAPES_CLASS_COLORS,
     CITYSCAPES_CLASS_NAMES,
     CITYSCAPES_EVAL_CLASSES,

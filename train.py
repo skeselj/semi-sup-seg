@@ -15,24 +15,29 @@ from datetime import datetime
 import torch
 from profiler import profiler
 
-import losses
-from checkpoints import get_init_checkpoint_metadata, load_unet_checkpoint
-from config import TRAINING_PRESETS, TrainingConfig, get_unet_config
-from constants import (
-    CITYSCAPES_IMAGE_HEIGHT,
-    CITYSCAPES_IMAGE_WIDTH,
+from semi_sup_seg import losses
+from semi_sup_seg.checkpoints import (
+    get_init_checkpoint_metadata,
+    load_unet_checkpoint,
+)
+from semi_sup_seg.config import (
+    TRAINING_PRESETS,
+    TrainingConfig,
+    get_unet_config,
+)
+from semi_sup_seg.constants import (
     DEFAULT_RUNS_DIR,
 )
-from inference import PseudoLabeler
-from models import UNet
-from trainer import Trainer
+from semi_sup_seg.inference import PseudoLabeler
+from semi_sup_seg.models import UNet
+from semi_sup_seg.trainer import Trainer
 
 logger = logging.getLogger(__name__)
 
 
 def train_unet_on_cityscapes(config: TrainingConfig) -> UNet:
     """
-    Train a UNet on finely labeled Cityscapes data, as set by `config`.
+    Train a UNet on Cityscapes data, as set by `config`.
     """
 
     torch.manual_seed(config.seed)
@@ -43,7 +48,12 @@ def train_unet_on_cityscapes(config: TrainingConfig) -> UNet:
     # Input shapes are fixed, so let cuDNN time & cache the fastest algorithms.
     torch.backends.cudnn.benchmark = True
 
-    labeled_dataset = config.labeled_dataset_class(seed=config.seed)
+    labeled_data = config.labeled_data
+    labeled_dataset = labeled_data.dataset_class(
+        image_dir=labeled_data.image_dir,
+        fine_label_dir=labeled_data.fine_label_dir,
+        seed=config.seed,
+    )
     label_metadata = labeled_dataset.LABEL_METADATA
     labeled_train_data_iter = labeled_dataset.iter_fine_train_datapoints(
         num_datapoints=config.train_datapoint_count
@@ -98,6 +108,7 @@ def train_unet_on_cityscapes(config: TrainingConfig) -> UNet:
 
             pseudo_labeling = config.pseudo_labeling
             pseudo_labeler, unlabeled_train_data_iter = None, None
+            unlabeled_image_size = None
             if pseudo_labeling is not None:
                 teacher = UNet(**unet_config).to(device)
                 if os.environ.get("COMPILE_MODEL", "1") != "0":
@@ -107,9 +118,13 @@ def train_unet_on_cityscapes(config: TrainingConfig) -> UNet:
                 )
 
                 unlabeled_dataset = pseudo_labeling.unlabeled_dataset_class(
-                    seed=config.seed
+                    image_dir=pseudo_labeling.unlabeled_image_dir,
+                    seed=config.seed,
+                    keep_every_nth_frame=(
+                        pseudo_labeling.unlabeled_keep_every_nth_frame
+                    ),
                 )
-                _ = unlabeled_dataset.image_index
+                unlabeled_image_size = unlabeled_dataset.get_image_size()
                 unlabeled_train_data_iter = (
                     unlabeled_dataset.iter_train_datapoints(
                         num_datapoints=config.train_datapoint_count
@@ -117,8 +132,7 @@ def train_unet_on_cityscapes(config: TrainingConfig) -> UNet:
                 )
 
         trainer = Trainer(
-            image_height=CITYSCAPES_IMAGE_HEIGHT,
-            image_width=CITYSCAPES_IMAGE_WIDTH,
+            labeled_image_size=labeled_dataset.get_image_size(),
             labeled_train_data_iter=labeled_train_data_iter,
             labeled_val_data_iter=labeled_val_data_iter,
             train_batch_size=config.train_batch_size,
@@ -130,6 +144,7 @@ def train_unet_on_cityscapes(config: TrainingConfig) -> UNet:
             checkpoint_metadata=checkpoint_metadata,
             pseudo_labeler=pseudo_labeler,
             unlabeled_train_data_iter=unlabeled_train_data_iter,
+            unlabeled_image_size=unlabeled_image_size,
         )
 
         with profiler.phase("warm up", on_gpu=True):

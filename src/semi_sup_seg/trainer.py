@@ -4,7 +4,6 @@ Module to support training a model w.r.t. a dataset.
 
 import itertools
 import logging
-import math
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -12,32 +11,28 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from profiler import profiler, torch_profile
 from torch import nn
 
-from checkpoints import get_checkpoint_file_name, save_checkpoint
-from constants import MAX_PIXEL_INT_VALUE
-from data import TensorDatapointIter, batch, prefetch
-from data.aug import Augmentation, AugmentationSampler
-from data.labels import LabelMetadata
-from inference import PseudoLabeler
-from metrics import (
+from semi_sup_seg.checkpoints import get_checkpoint_file_name, save_checkpoint
+from semi_sup_seg.constants import MAX_PIXEL_INT_VALUE
+from semi_sup_seg.data import TensorDatapointIter, batch, prefetch
+from semi_sup_seg.data.aug import Augmentation, AugmentationSampler
+from semi_sup_seg.data.labels import LabelMetadata
+from semi_sup_seg.inference import PseudoLabeler
+from semi_sup_seg.metrics import (
     compute_public_benchmark_metrics,
     get_batch_confusion_matrix,
     get_empty_confusion_matrix,
 )
-from precision import DEFAULT_MIXED_PRECISION, autocast
-from train_logging import (
+from semi_sup_seg.precision import DEFAULT_MIXED_PRECISION, autocast
+from semi_sup_seg.train_logging import (
     DEFAULT_LOG_EVERY_N,
     DEFAULT_LOG_IMAGE_COUNT,
-    DEFAULT_LOG_IMAGE_DOWNSCALE,
     TrainingLogger,
 )
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_TRAIN_DOWNSCALE = 2
 
 
 def _get_synthetic_batch(
@@ -62,32 +57,30 @@ class Trainer:
     def __init__(
         self,
         *,
-        image_height: int,
-        image_width: int,
+        labeled_image_size: tuple[int, int],
         labeled_train_data_iter: Iterator[tuple[np.ndarray, np.ndarray]],
         labeled_val_data_iter: Iterator[tuple[np.ndarray, np.ndarray]],
         unlabeled_train_data_iter: Iterator[tuple[np.ndarray]] | None = None,
+        unlabeled_image_size: tuple[int, int] | None = None,
         label_metadata: LabelMetadata,
-        train_downscale: int = DEFAULT_TRAIN_DOWNSCALE,
         pseudo_labeler: PseudoLabeler | None = None,
         augmentation_sampler: AugmentationSampler | None = None,
         train_batch_size: int,
         val_batch_size: int,
-        loss_fn: Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor],
+        loss_fn: Callable[..., torch.Tensor],
         mixed_precision: bool = DEFAULT_MIXED_PRECISION,
         log_dir: Path | None = None,
         checkpoint_metadata: dict[str, Any] | None = None,
     ):
         # Data, as read from filesystem.
-        self.image_height = image_height
-        self.image_width = image_width
+        self.labeled_image_size = labeled_image_size
         self.labeled_train_data_iter = labeled_train_data_iter
         self.labeled_val_data_iter = labeled_val_data_iter
         self.unlabeled_train_data_iter = unlabeled_train_data_iter
+        self.unlabeled_image_size = unlabeled_image_size
         self.label_metadata = label_metadata
 
         # Data transformation.
-        self.train_downscale = train_downscale
         self.pseudo_labeler = pseudo_labeler
         self.augmentation_sampler = augmentation_sampler
 
@@ -99,7 +92,9 @@ class Trainer:
         self.log_dir = log_dir
         self.checkpoint_metadata = checkpoint_metadata or {}
 
-        if pseudo_labeler is not None and unlabeled_train_data_iter is None:
+        if pseudo_labeler is not None and (
+            unlabeled_train_data_iter is None or unlabeled_image_size is None
+        ):
             raise ValueError("Pseudo-labeling needs unlabeled train data.")
 
         self.label_map = label_metadata.get_raw_train_label_map()
@@ -113,52 +108,6 @@ class Trainer:
         self.training_logger = TrainingLogger(
             log_dir=log_dir, label_metadata=label_metadata
         )
-
-    def _save_checkpoint(
-        self,
-        model: nn.Module,
-        optimizer: torch.optim.Optimizer,
-        datapoints_seen: int,
-        total_datapoint_count: int,
-        val_metrics: dict[str, float] | None,
-    ) -> None:
-        """
-        Save model & optimizer state under `self.log_dir`, if it is set.
-        """
-
-        if self.log_dir is None:
-            return
-
-        path = self.log_dir / get_checkpoint_file_name(
-            datapoints_seen, total_datapoint_count
-        )
-        with profiler.phase("save checkpoint"):
-            save_checkpoint(
-                path,
-                model=model,
-                optimizer=optimizer,
-                grad_scaler=self.grad_scaler,
-                metadata={
-                    **self.checkpoint_metadata,
-                    "datapoints_seen": datapoints_seen,
-                    "val_metrics": val_metrics,
-                    "teacher_datapoints_seen": (
-                        self.pseudo_labeler.teacher_datapoints_seen
-                        if self.pseudo_labeler is not None
-                        else None
-                    ),
-                },
-            )
-
-        logger.info(f"Saved checkpoint to '{path}'.")
-
-    def _update_teacher(self, model: nn.Module, datapoints_seen: int) -> None:
-        """
-        Let the pseudo-labeler, if any, update its teacher from `model`.
-        """
-
-        if self.pseudo_labeler is not None:
-            self.pseudo_labeler.update_teacher(model, datapoints_seen)
 
     def _get_mixed_batch_sizes(self) -> tuple[int, int]:
         """
@@ -174,6 +123,28 @@ class Trainer:
             // (labeled_part + unlabeled_part)
         )
         return labeled_batch_size, self.train_batch_size - labeled_batch_size
+
+    def _get_datapoint_loss_weights(
+        self, labeled_count: int, unlabeled_count: int, device: torch.device
+    ) -> torch.Tensor | None:
+        """
+        Get (B,) loss multipliers for a batch: labeled, then unlabeled.
+        """
+
+        if unlabeled_count == 0:
+            return None
+
+        labeled_multiplier, unlabeled_multiplier = (
+            self.pseudo_labeler.config.labeled_and_unlabeled_loss_multipliers
+        )
+        return torch.cat(
+            [
+                torch.full((labeled_count,), labeled_multiplier, device=device),
+                torch.full(
+                    (unlabeled_count,), unlabeled_multiplier, device=device
+                ),
+            ]
+        )
 
     def _iterate_data(
         self,
@@ -216,9 +187,6 @@ class Trainer:
     ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]:
         """
         Yield (image, label, unlabeled image) train batches.
-
-        Unlabeled image batches are None until pseudo-labeling starts.
-        Labeled & unlabeled datapoints both count towards `datapoint_count`.
         """
 
         warmup_datapoint_count = datapoint_count
@@ -265,53 +233,34 @@ class Trainer:
 
     @staticmethod
     def _to_images(
-        image_batch: torch.Tensor, device: torch.device, downscale: int = 1
+        image_batch: torch.Tensor, device: torch.device
     ) -> torch.Tensor:
         """
         Convert a uint8 image batch to model-ready images on device.
-
-        Images are downscaled by `downscale`, to the size labels are.
         """
 
-        # uint8 (B, H, W, 3) --> float (B, 3, H / dscale, W / dscale) in [0, 1].
+        # uint8 (B, H, W, 3) --> float (B, 3, H, W) in [0, 1].
         images = image_batch.to(device, non_blocking=True)
-        images = images.permute(0, 3, 1, 2).float() / MAX_PIXEL_INT_VALUE
-        if downscale != 1:
-            images = F.interpolate(
-                images,
-                # The size of `[::downscale, ::downscale]` slices.
-                size=(
-                    math.ceil(images.shape[-2] / downscale),
-                    math.ceil(images.shape[-1] / downscale),
-                ),
-                mode="bilinear",
-                antialias=True,
-            )
-
-        return images
+        return images.permute(0, 3, 1, 2).float() / MAX_PIXEL_INT_VALUE
 
     def _to_tensors(
         self,
         image_batch: torch.Tensor,
         label_batch: torch.Tensor,
         device: torch.device,
-        downscale: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Convert uint8 batches to model-ready tensors on device.
-
-        Images & labels are downscaled by `downscale`.
         """
 
-        # uint8 (B, H, W) --> int64 (B, H / dscale, W / dscale).
+        # uint8 (B, H, W) --> int64 (B, H, W) training labels.
         labels = label_batch.to(device, non_blocking=True)
-        labels = labels[:, ::downscale, ::downscale]
 
         if self.label_map.device != device:
             self.label_map = self.label_map.to(device)
         labels = self.label_map[labels.int()]
 
-        images = self._to_images(image_batch, device, downscale)
+        images = self._to_images(image_batch, device)
 
         return images, labels
 
@@ -323,20 +272,12 @@ class Trainer:
         unlabeled_image_batch: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, Augmentation | None]:
         """
-        Like `_to_tensors`, but downscaled and potentially augmented.
-
-        If `unlabeled_image_batch` is set, it's pseudo-labeled & appended.
-        Pseudo-labeling happens before augmentation, so the teacher sees
-        un-augmented images.
+        Like `_to_tensors`, but potentially augmented & auto-labeled.
         """
 
-        images, labels = self._to_tensors(
-            image_batch, label_batch, device, downscale=self.train_downscale
-        )
+        images, labels = self._to_tensors(image_batch, label_batch, device)
         if unlabeled_image_batch is not None:
-            unlabeled_images = self._to_images(
-                unlabeled_image_batch, device, downscale=self.train_downscale
-            )
+            unlabeled_images = self._to_images(unlabeled_image_batch, device)
             images = torch.cat([images, unlabeled_images])
             labels = torch.cat(
                 [labels, self.pseudo_labeler.label(unlabeled_images)]
@@ -349,8 +290,15 @@ class Trainer:
             images, labels, ignore_id=self.label_metadata.ignore_id
         )
 
-    def _loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        return self.loss_fn(logits, labels, self.label_metadata.ignore_id)
+    def _loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        datapoint_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.loss_fn(
+            logits, labels, self.label_metadata.ignore_id, datapoint_weights
+        )
 
     @torch.no_grad()
     def _val_step(
@@ -367,9 +315,14 @@ class Trainer:
         images, labels = self._to_tensors(image_batch, label_batch, device)
         with autocast(device, self.mixed_precision):
             logits = model(images)
-            loss = self._loss(logits, labels)
+            datapoint_losses = torch.stack(
+                [
+                    self._loss(logits[i : i + 1], labels[i : i + 1])
+                    for i in range(len(images))
+                ]
+            )
 
-        return images, labels, logits, loss
+        return images, labels, logits, datapoint_losses
 
     def _warm_up_step(
         self,
@@ -386,8 +339,11 @@ class Trainer:
         images, labels, _ = self._to_train_tensors(
             image_batch, label_batch, device, unlabeled_image_batch
         )
+        datapoint_weights = self._get_datapoint_loss_weights(
+            len(image_batch), len(images) - len(image_batch), device
+        )
         with autocast(device, self.mixed_precision):
-            loss = self._loss(model(images), labels)
+            loss = self._loss(model(images), labels, datapoint_weights)
 
         loss.backward()
         model.zero_grad(set_to_none=True)
@@ -409,16 +365,17 @@ class Trainer:
     ]:
         """
         Evaluate on a batch, and update the model.
-
-        Also returns the augmentation applied to the batch, if any.
         """
 
         images, labels, augmentation = self._to_train_tensors(
             image_batch, label_batch, device, unlabeled_image_batch
         )
+        datapoint_weights = self._get_datapoint_loss_weights(
+            len(image_batch), len(images) - len(image_batch), device
+        )
         with autocast(device, self.mixed_precision):
             logits = model(images)
-            loss = self._loss(logits, labels)
+            loss = self._loss(logits, labels, datapoint_weights)
 
         optimizer.zero_grad(set_to_none=True)
         self.grad_scaler.scale(loss).backward()
@@ -444,7 +401,7 @@ class Trainer:
         was_training = model.training
 
         datapoints_seen = 0
-        loss_sum = torch.zeros((), device=device)
+        datapoint_losses: list[torch.Tensor] = []
         confusion = get_empty_confusion_matrix(self.label_metadata, device)
 
         try:
@@ -456,12 +413,12 @@ class Trainer:
                 is_logging_step = datapoints_seen == 0
 
                 with profiler.phase("infer on val batch", on_gpu=True):
-                    images, labels, logits, loss = self._val_step(
+                    images, labels, logits, batch_losses = self._val_step(
                         model, image_batch, label_batch, device
                     )
 
                     datapoints_seen += len(images)
-                    loss_sum += loss * len(images)
+                    datapoint_losses.append(batch_losses)
                     confusion += get_batch_confusion_matrix(
                         labels, logits.argmax(dim=1), self.label_metadata
                     )
@@ -488,12 +445,15 @@ class Trainer:
             metrics = compute_public_benchmark_metrics(
                 confusion, self.label_metadata
             )
+            all_losses = torch.cat(datapoint_losses).float()
             self.training_logger.log_val_metrics(
                 datapoints_seen=log_train_datapoints_seen,
                 total_datapoint_count=log_train_total_datapoint_count,
-                loss=(loss_sum / datapoints_seen).item(),
+                loss_avg=all_losses.mean().item(),
+                loss_stddev=all_losses.std(correction=0).item(),
                 metrics=metrics,
             )
+
         return metrics
 
     def warm_up(self, model: nn.Module) -> None:
@@ -507,10 +467,10 @@ class Trainer:
         is_eval = self.label_map != self.label_metadata.ignore_id
         label_id = int(is_eval.nonzero()[0])
         train_batch = _get_synthetic_batch(
-            self.train_batch_size, self.image_height, self.image_width, label_id
+            self.train_batch_size, *self.labeled_image_size, label_id
         )
         val_batch = _get_synthetic_batch(
-            self.val_batch_size, self.image_height, self.image_width, label_id
+            self.val_batch_size, *self.labeled_image_size, label_id
         )
 
         try:
@@ -524,16 +484,12 @@ class Trainer:
                 self._warm_up_step(
                     model,
                     *_get_synthetic_batch(
-                        labeled_batch_size,
-                        self.image_height,
-                        self.image_width,
-                        label_id,
+                        labeled_batch_size, *self.labeled_image_size, label_id
                     ),
                     device,
                     unlabeled_image_batch=_get_synthetic_batch(
                         unlabeled_batch_size,
-                        self.image_height,
-                        self.image_width,
+                        *self.unlabeled_image_size,
                         label_id,
                     )[0],
                 )
@@ -542,6 +498,52 @@ class Trainer:
             self._val_step(model, *val_batch, device)
         finally:
             model.train(was_training)
+
+    def _save_checkpoint(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        datapoints_seen: int,
+        total_datapoint_count: int,
+        val_metrics: dict[str, float] | None,
+    ) -> None:
+        """
+        Save model & optimizer state under `self.log_dir`, if it is set.
+        """
+
+        if self.log_dir is None:
+            return
+
+        path = self.log_dir / get_checkpoint_file_name(
+            datapoints_seen, total_datapoint_count
+        )
+        with profiler.phase("save checkpoint"):
+            save_checkpoint(
+                path,
+                model=model,
+                optimizer=optimizer,
+                grad_scaler=self.grad_scaler,
+                metadata={
+                    **self.checkpoint_metadata,
+                    "datapoints_seen": datapoints_seen,
+                    "val_metrics": val_metrics,
+                    "teacher_datapoints_seen": (
+                        self.pseudo_labeler.teacher_datapoints_seen
+                        if self.pseudo_labeler is not None
+                        else None
+                    ),
+                },
+            )
+
+        logger.info(f"Saved checkpoint to '{path}'.")
+
+    def _update_teacher(self, model: nn.Module, datapoints_seen: int) -> None:
+        """
+        Let the pseudo-labeler, if any, update its teacher from `model`.
+        """
+
+        if self.pseudo_labeler is not None:
+            self.pseudo_labeler.update_teacher(model, datapoints_seen)
 
     def train(
         self,
@@ -649,10 +651,6 @@ class Trainer:
                             labels=labels,
                             logits=logits,
                             num_images_to_log=log_image_count,
-                            image_downscale=(
-                                DEFAULT_LOG_IMAGE_DOWNSCALE
-                                // self.train_downscale
-                            ),
                         )
 
                     val_metrics = self.validate(

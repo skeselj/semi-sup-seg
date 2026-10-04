@@ -6,18 +6,45 @@ import dataclasses
 from pathlib import Path
 from typing import Any
 
-import losses
-from constants import DEFAULT_SEED
-from data import (
+from semi_sup_seg import losses
+from semi_sup_seg.constants import CITYSCAPES_DIR, DEFAULT_SEED
+from semi_sup_seg.data import (
     CityscapesLabeledDataset,
     CityscapesPersonLabeledDataset,
     CityscapesUnlabeledDataset,
 )
-from data.aug import AugmentationSampler
-from models import UNet
+from semi_sup_seg.data.aug import AugmentationSampler
+from semi_sup_seg.models import UNet
 
 DEFAULT_BASE_HEIGHT = 256
 DEFAULT_BASE_WIDTH = 512
+
+
+def _to_plain(value: Any) -> Any:
+    """
+    Convert classes to their names & paths to strings, recursively.
+    """
+
+    if isinstance(value, dict):
+        return {key: _to_plain(item) for key, item in value.items()}
+    if isinstance(value, type):
+        return value.__name__
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class LabeledDataConfig:
+    """
+    Settings for the labeled data: where it is.
+    """
+
+    # fmt: off
+    dataset_class: type[CityscapesLabeledDataset] = CityscapesLabeledDataset
+    image_dir: Path = CITYSCAPES_DIR / "leftImg8bit_2x_downsampled"
+    fine_label_dir: Path = CITYSCAPES_DIR / "gtFine_2x_downsampled"
+    # fmt: on
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -28,12 +55,15 @@ class PseudoLabelingConfig:
 
     # fmt: off
     unlabeled_dataset_class: type[CityscapesUnlabeledDataset] = CityscapesUnlabeledDataset
+    unlabeled_image_dir: Path = CITYSCAPES_DIR / "leftImg8bit_sequence_2x_downsampled"
+    unlabeled_keep_every_nth_frame: int = 2
 
     warmup_datapoints_before_pseudo_labeling: int = 300_000
     labeled_to_unlabeled_ratio: tuple[int, int] = (1, 7)
+    labeled_and_unlabeled_loss_multipliers: tuple[float, float] = (4/1, 4/7)
 
     teacher_lag: int = 10_000
-    teacher_min_confidence: float = 0.75
+    teacher_min_confidence: float = 0.60
     # fmt: on
 
     def __post_init__(self) -> None:
@@ -45,6 +75,11 @@ class PseudoLabelingConfig:
             raise ValueError(
                 f"{self.teacher_lag=} must be in "
                 f"[0, {self.warmup_datapoints_before_pseudo_labeling=}]."
+            )
+        if min(self.labeled_and_unlabeled_loss_multipliers) < 0:
+            raise ValueError(
+                f"{self.labeled_and_unlabeled_loss_multipliers=} must be "
+                "non-negative."
             )
         if not 0 <= self.teacher_min_confidence < 1:
             raise ValueError(
@@ -59,7 +94,7 @@ class TrainingConfig:
     """
 
     # fmt: off
-    labeled_dataset_class: type[CityscapesLabeledDataset]
+    labeled_data: LabeledDataConfig
     pseudo_labeling: PseudoLabelingConfig | None = None
     augmentation_sampler: AugmentationSampler | None = None
 
@@ -120,18 +155,11 @@ class TrainingConfig:
                 )
 
     def to_dict(self) -> dict[str, Any]:
-        ret = dataclasses.asdict(self)
+        """
+        Get these settings as plain values, e.g. classes as their names.
+        """
 
-        ret["labeled_dataset_class"] = self.labeled_dataset_class.__name__
-        if self.pseudo_labeling is not None:
-            ret["pseudo_labeling"]["unlabeled_dataset_class"] = (
-                self.pseudo_labeling.unlabeled_dataset_class.__name__
-            )
-        for name in ("init_checkpoint_path", "log_dir"):
-            if ret[name] is not None:
-                ret[name] = str(ret[name])
-
-        return ret
+        return _to_plain(dataclasses.asdict(self))
 
 
 def get_unet_config(
@@ -181,41 +209,52 @@ def get_unet_config(
 
 # Preset name --> settings of that kind of training, except where it logs.
 TRAINING_PRESETS: dict[str, TrainingConfig] = {
-    "naive_supervised_small": TrainingConfig(
-        labeled_dataset_class=CityscapesPersonLabeledDataset,
+    "plain_supervised": TrainingConfig(
+        labeled_data=LabeledDataConfig(
+            dataset_class=CityscapesPersonLabeledDataset
+        ),
         augmentation_sampler=None,
         pseudo_labeling=None,
-        train_datapoint_count=100_000,
+        train_datapoint_count=250_000,
         val_datapoint_count=None,
         train_batch_size=8,
         val_batch_size=1,
         init_checkpoint_path=None,
+        learning_rate=1e-4,
         log_every_n_datapoints=5_000,
     ),
-    "augmented_supervised_small": TrainingConfig(
-        labeled_dataset_class=CityscapesPersonLabeledDataset,
+    "augmented_supervised": TrainingConfig(
+        labeled_data=LabeledDataConfig(
+            dataset_class=CityscapesPersonLabeledDataset
+        ),
         augmentation_sampler=AugmentationSampler(),
         pseudo_labeling=None,
-        train_datapoint_count=100_000,
+        train_datapoint_count=1_000_000,
         val_datapoint_count=None,
         train_batch_size=8,
         val_batch_size=1,
         init_checkpoint_path=None,
-        log_every_n_datapoints=2_000,
+        learning_rate=1e-4,
+        log_every_n_datapoints=10_000,
     ),
-    "augmented_semisupervised_small": TrainingConfig(
-        labeled_dataset_class=CityscapesPersonLabeledDataset,
+    "augmented_semisupervised": TrainingConfig(
+        labeled_data=LabeledDataConfig(
+            dataset_class=CityscapesPersonLabeledDataset
+        ),
         augmentation_sampler=AugmentationSampler(),
         pseudo_labeling=PseudoLabelingConfig(
-            warmup_datapoints_before_pseudo_labeling=10_000,
+            warmup_datapoints_before_pseudo_labeling=50_000,
             labeled_to_unlabeled_ratio=(1, 7),
-            teacher_lag=10_000,
+            labeled_and_unlabeled_loss_multipliers=(4 / 1, 4 / 7),
+            teacher_lag=50_000,
+            teacher_min_confidence=0.60,
         ),
-        train_datapoint_count=100_000,
+        train_datapoint_count=3_000_000,
         val_datapoint_count=None,
         train_batch_size=8,
         val_batch_size=1,
-        init_checkpoint_path=Path("/mnt/hdd1/projects/semi-sup-seg/logs/runs/augmented_supervised_small_augmented_supervised_small_unet_cityscapes_20261004_115357/checkpoint_100000.pt"),
-        log_every_n_datapoints=5_000,
+        init_checkpoint_path=Path("./logs/runs/oct_04_evening_augmented_supervised_unet_cityscapes_20261004_215123/checkpoint_0950000.pt"),
+        learning_rate=1e-5,
+        log_every_n_datapoints=10_000,
     ),
 }

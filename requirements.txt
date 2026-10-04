@@ -17,3 +17,6 @@ mini-profiler @ git+https://github.com/skeselj/mini-profiler.git@main
 
 matplotlib==3.11.2
 ipykernel==7.4.0
+
+# This project's own code, in src/.
+-e .
