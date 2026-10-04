@@ -44,6 +44,7 @@ from data import (
     CityscapesPersonLabeledDataset,
     LabelMetadata,
 )
+from data_aug import Augmentation, AugmentationSampler
 from data_iter import TensorDatapointIter, batch, prefetch
 from metrics import (
     compute_public_benchmark_metrics,
@@ -167,6 +168,23 @@ class TrainingLogger:
             ]:
                 self.writer.add_scalar(name, value, datapoints_seen)
 
+    def log_augmentations(
+        self, datapoints_seen: int, augmentation: Augmentation
+    ) -> None:
+        """
+        Log histograms of the parameters of augmentations applied.
+        """
+
+        if self.writer is None:
+            return
+
+        for name, values in augmentation.to_dict().items():
+            self.writer.add_histogram(
+                f"train_augmentation/{name}",
+                values.float().cpu(),
+                datapoints_seen,
+            )
+
     def log_val_metrics(
         self,
         datapoints_seen: int,
@@ -265,6 +283,7 @@ class Trainer:
         label_metadata: LabelMetadata,
         log_dir: Path | None,
         loss_fn: Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor],
+        augmentation_sampler: AugmentationSampler | None = None,
         train_downscale: int = DEFAULT_TRAIN_DOWNSCALE,
         mixed_precision: bool = DEFAULT_MIXED_PRECISION,
         checkpoint_metadata: dict[str, Any] | None = None,
@@ -278,6 +297,7 @@ class Trainer:
         self.label_metadata = label_metadata
         self.log_dir = log_dir
         self.loss_fn = loss_fn
+        self.augmentation_sampler = augmentation_sampler
         self.train_downscale = train_downscale
         self.mixed_precision = mixed_precision
         self.checkpoint_metadata = checkpoint_metadata or {}
@@ -417,6 +437,26 @@ class Trainer:
 
         return images, labels
 
+    def _to_train_tensors(
+        self,
+        image_batch: torch.Tensor,
+        label_batch: torch.Tensor,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, Augmentation | None]:
+        """
+        Like `_to_tensors`, but downscaled and potentially augmented.
+        """
+
+        images, labels = self._to_tensors(
+            image_batch, label_batch, device, downscale=self.train_downscale
+        )
+        if self.augmentation_sampler is None:
+            return images, labels, None
+
+        return self.augmentation_sampler.augment(
+            images, labels, ignore_id=self.label_metadata.ignore_id
+        )
+
     def _loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         return self.loss_fn(logits, labels, self.label_metadata.ignore_id)
 
@@ -450,8 +490,8 @@ class Trainer:
         Evaluate on a batch, do the backward pass, but do not update model.
         """
 
-        images, labels = self._to_tensors(
-            image_batch, label_batch, device, downscale=self.train_downscale
+        images, labels, _ = self._to_train_tensors(
+            image_batch, label_batch, device
         )
         with autocast(device, self.mixed_precision):
             loss = self._loss(model(images), labels)
@@ -466,13 +506,21 @@ class Trainer:
         label_batch: torch.Tensor,
         optimizer: torch.optim.Optimizer,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Augmentation | None,
+    ]:
         """
         Evaluate on a batch, and update the model.
+
+        Also returns the augmentation applied to the batch, if any.
         """
 
-        images, labels = self._to_tensors(
-            image_batch, label_batch, device, downscale=self.train_downscale
+        images, labels, augmentation = self._to_train_tensors(
+            image_batch, label_batch, device
         )
         with autocast(device, self.mixed_precision):
             logits = model(images)
@@ -483,7 +531,7 @@ class Trainer:
         self.grad_scaler.step(optimizer)
         self.grad_scaler.update()
 
-        return images, labels, logits.detach(), loss.detach()
+        return images, labels, logits.detach(), loss.detach(), augmentation
 
     @torch.no_grad()
     def validate(
@@ -598,6 +646,7 @@ class Trainer:
 
         datapoints_seen = 0
         loss_sum_since_last_log = torch.zeros((), device=device)
+        augmentations_since_last_log: list[Augmentation] = []
 
         datapoints_seen_at_last_log = 0
         datapoint_index_for_next_log = log_every_n_datapoints
@@ -626,16 +675,20 @@ class Trainer:
                     train_datapoint_count
                 ):
                     with profiler.phase("infer on train batch", on_gpu=True):
-                        images, labels, logits, loss = self._train_step(
-                            model,
-                            image_batch,
-                            label_batch,
-                            optimizer,
-                            device,
+                        images, labels, logits, loss, augmentation = (
+                            self._train_step(
+                                model,
+                                image_batch,
+                                label_batch,
+                                optimizer,
+                                device,
+                            )
                         )
 
                         datapoints_seen += len(images)
                         loss_sum_since_last_log += loss * len(images)
+                        if augmentation is not None:
+                            augmentations_since_last_log.append(augmentation)
 
                     end_torch_profile_step()
 
@@ -663,6 +716,13 @@ class Trainer:
                             loss=mean_loss_since_last_log,
                             learning_rate=optimizer.param_groups[0]["lr"],
                         )
+                        if augmentations_since_last_log:
+                            self.training_logger.log_augmentations(
+                                datapoints_seen=datapoints_seen,
+                                augmentation=Augmentation.cat(
+                                    augmentations_since_last_log
+                                ),
+                            )
                         self.training_logger.log_images(
                             log_base_name="train",
                             datapoints_seen=datapoints_seen,
@@ -693,6 +753,7 @@ class Trainer:
                     datapoints_seen_at_last_checkpoint = datapoints_seen
 
                     loss_sum_since_last_log.zero_()
+                    augmentations_since_last_log.clear()
 
                     time_of_last_log = time.perf_counter()
                     datapoints_seen_at_last_log = datapoints_seen
@@ -734,6 +795,7 @@ class TrainingConfig:
 
     learning_rate: float = 1e-4
     loss_fn_name: str = "cross_entropy"
+    augmentation_sampler: AugmentationSampler | None = None
 
     log_dir: Path | None = None
 
@@ -880,6 +942,7 @@ def train_unet_on_cityscapes(config: TrainingConfig) -> UNet:
             label_metadata=label_metadata,
             log_dir=config.log_dir,
             loss_fn=getattr(metrics, config.loss_fn_name),
+            augmentation_sampler=config.augmentation_sampler,
             checkpoint_metadata=checkpoint_metadata,
         )
 
@@ -917,8 +980,8 @@ if __name__ == "__main__":
             train_batch_size=8,
             val_batch_size=1,
             init_checkpoint_path=None,
-            loss_fn_name="left_piecewise_linear_cross_entropy",
-            log_every_n_datapoints=10_000,
+            augmentation_sampler=AugmentationSampler(),
+            log_every_n_datapoints=5_000,
             log_dir=(
                 DEFAULT_RUNS_DIR
                 / f"{label}_unet_cityscapes_{start_time:%Y%m%d_%H%M%S}"

@@ -30,7 +30,7 @@ def left_piecewise_linear_cross_entropy(
     logits: torch.Tensor,
     labels: torch.Tensor,
     ignore_index: int,
-    left_prob_boundary: float | None = 1/4,
+    left_prob_boundary: float | None = 1 / 4,
 ) -> torch.Tensor:
     """
     "Left-piecewise linear" cross entropy.
