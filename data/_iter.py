@@ -11,12 +11,28 @@ from typing import TypeVar
 import numpy as np
 import torch
 
-from data import CityscapesLabeledDatapoint, CityscapesUnlabeledDatapoint
-
 DEFAULT_PREFETCH_DEPTH = 16
 
 T = TypeVar("T")
 TensorDatapointIter = Iterator[tuple[torch.Tensor, torch.Tensor]]
+
+
+def iter_shuffled(
+    items: list[T], rng: np.random.Generator, count: int
+) -> Iterator[T]:
+    """
+    Yield `count` of `items`, reshuffling `items` after each pass over them.
+    """
+
+    if not items and count > 0:
+        raise ValueError(f"Can't yield {count:,} items from no items.")
+
+    def shuffled_idxs_gen() -> Iterator[int]:
+        while True:
+            yield from rng.permutation(len(items))
+
+    for i in itertools.islice(shuffled_idxs_gen(), count):
+        yield items[i]
 
 
 def prefetch(
@@ -73,48 +89,21 @@ def prefetch(
 
 
 def batch(
-    data_iter: Iterator[CityscapesLabeledDatapoint], batch_size: int
-) -> TensorDatapointIter:
+    data_iter: Iterator[tuple[np.ndarray, ...]], batch_size: int
+) -> Iterator[tuple[torch.Tensor, ...]]:
     """
-    Yield uint8 (B, H, W, 3) image and (B, H, W) label batches.
-
-    Batches are pinned when CUDA is available, for async host-to-device copy.
-    """
-
-    pin = torch.cuda.is_available()
-
-    while datapoints := list(itertools.islice(data_iter, batch_size)):
-        image_batch = torch.from_numpy(
-            np.stack([dp.image.ary for dp in datapoints])
-        )
-        label_batch = torch.from_numpy(
-            np.stack([dp.label.ary for dp in datapoints])
-        )
-
-        if pin:
-            image_batch = image_batch.pin_memory()
-            label_batch = label_batch.pin_memory()
-
-        yield image_batch, label_batch
-
-
-def batch_images(
-    data_iter: Iterator[CityscapesUnlabeledDatapoint], batch_size: int
-) -> Iterator[torch.Tensor]:
-    """
-    Yield uint8 (B, H, W, 3) image batches, ignoring any labels.
-
-    Batches are pinned when CUDA is available, for async host-to-device copy.
+    Yield batches of loaded datapoints, e.g. uint8 (B, H, W, 3) image and
+    (B, H, W) label batches.
     """
 
     pin = torch.cuda.is_available()
 
     while datapoints := list(itertools.islice(data_iter, batch_size)):
-        image_batch = torch.from_numpy(
-            np.stack([dp.image.ary for dp in datapoints])
+        tensors = tuple(
+            torch.from_numpy(np.stack(arrays)) for arrays in zip(*datapoints)
         )
 
         if pin:
-            image_batch = image_batch.pin_memory()
+            tensors = tuple(tensor.pin_memory() for tensor in tensors)
 
-        yield image_batch
+        yield tensors

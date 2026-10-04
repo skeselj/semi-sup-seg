@@ -261,6 +261,9 @@ class UNet(nn.Module):
 
         self.reset_parameters()
 
+        # Channels-last is the fastest layout for fp16 convolutions.
+        self.to(memory_format=torch.channels_last)
+
         # fmt: off
         level_lines = []
 
@@ -365,21 +368,12 @@ class UNet(nn.Module):
 
         with torch_phase("resize_in"):
             x = self._resize(x, self.base_height, self.base_width)
+            x = x.contiguous(memory_format=torch.channels_last)
 
         x = self._normalized_forward(x)
 
         with torch_phase("resize_out"):
             return self._resize(x, output_height, output_width)
-
-    @torch.inference_mode()
-    def predict(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Predict class labels for a (B, C, H, W) tensor.
-
-        Returns a (B, 1, H, W) tensor of class labels.
-        """
-
-        return self(x).argmax(dim=-3, keepdim=True).to(torch.uint8)
 
     def compile(self, *args, **kwargs) -> None:
         """

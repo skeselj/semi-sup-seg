@@ -2,65 +2,9 @@
 Module to support evaluating semantic segmentation models.
 """
 
-import math
-
 import torch
-import torch.nn.functional as F
 
-from data import LabelMetadata
-
-
-def cross_entropy(
-    logits: torch.Tensor, labels: torch.Tensor, ignore_index: int
-) -> torch.Tensor:
-    """
-    Plain cross entropy.
-
-    Parameters
-    ----------
-        logits: (B, C, H, W) unnormalized scores, one channel per class.
-        labels: (B, H, W) class IDs in [0, C), or ignore_index.
-        ignore_index: label value of pixels excluded from the loss.
-    """
-
-    return F.cross_entropy(logits, labels, ignore_index=ignore_index)
-
-
-def left_piecewise_linear_cross_entropy(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    ignore_index: int,
-    left_prob_boundary: float | None = 1 / 4,
-) -> torch.Tensor:
-    """
-    "Left-piecewise linear" cross entropy.
-
-    Say `q` is the logit-implied probability of the true class.
-    If `left_prob_boundary` is set to `L`, then loss is linear in `[0, L]`.
-
-    Parameters
-    ----------
-        logits: (B, C, H, W) unnormalized scores, one channel per class.
-        labels: (B, H, W) class IDs in [0, C), or ignore_index.
-        ignore_index: label value of pixels excluded from the loss.
-        left_prob_boundary: `L` in (0, 1], or None for plain cross entropy.
-    """
-
-    valid = labels != ignore_index
-    safe_labels = labels.where(valid, 0).long().unsqueeze(1)
-
-    log_probs = torch.log_softmax(logits.float(), dim=1)
-    # -log p(true class), shape (B, H, W).
-    nll = -log_probs.gather(dim=1, index=safe_labels).squeeze(1)
-
-    loss = nll
-    if left_prob_boundary is not None:
-        q = torch.exp(-nll)
-        # Tangent to -log(q) at q = left_prob_boundary.
-        tangent = -math.log(left_prob_boundary) + 1 - q / left_prob_boundary
-        loss = loss.where(q >= left_prob_boundary, tangent)
-
-    return loss[valid].mean()
+from data.labels import LabelMetadata
 
 
 def get_per_image_confusion_matrices(
@@ -75,7 +19,8 @@ def get_per_image_confusion_matrices(
     Element [b, i, j] is num. pixels in image b, with label i, predicted as j.
     """
 
-    assert label.shape == preds.shape
+    if label.shape != preds.shape:
+        raise ValueError(f"{label.shape=} must equal {preds.shape=}.")
     if not device:
         device = label.device
 

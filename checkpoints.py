@@ -26,9 +26,6 @@ def get_checkpoint_file_name(
     """
     Get the file name of a checkpoint saved after `datapoints_seen` of
     `total_datapoint_count` train datapoints.
-
-    The count is zero-padded to the width of the total, so file names sort in
-    training order.
     """
 
     width = len(str(total_datapoint_count))
@@ -93,26 +90,3 @@ def get_init_checkpoint_metadata(
         "sha256": _sha256(path),
         "metadata": checkpoint.get("metadata"),
     }
-
-
-def get_checkpoint_lineage(checkpoint: dict[str, Any]) -> list[str]:
-    """
-    Get paths of the checkpoints `checkpoint` was initialized from, newest first.
-    """
-
-    lineage = []
-    metadata = checkpoint.get("metadata")
-    while metadata and metadata.get("init_checkpoint"):
-        init_checkpoint = metadata["init_checkpoint"]
-        lineage.append(init_checkpoint["path"])
-        metadata = init_checkpoint.get("metadata")
-
-    return lineage
-
-
-def get_checkpoint_dataset_name(checkpoint: dict[str, Any]) -> str:
-    """
-    Get the class name of the dataset `checkpoint` was trained on.
-    """
-
-    return checkpoint["metadata"]["training_config"]["labeled_dataset_class"]
