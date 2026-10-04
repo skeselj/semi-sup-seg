@@ -12,7 +12,7 @@ import math
 import os
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -23,6 +23,7 @@ from profiler import profiler, torch_profile
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
+import metrics
 from checkpoints import (
     get_checkpoint_file_name,
     get_init_checkpoint_metadata,
@@ -263,6 +264,7 @@ class Trainer:
         val_batch_size: int,
         label_metadata: LabelMetadata,
         log_dir: Path | None,
+        loss_fn: Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor],
         train_downscale: int = DEFAULT_TRAIN_DOWNSCALE,
         mixed_precision: bool = DEFAULT_MIXED_PRECISION,
         checkpoint_metadata: dict[str, Any] | None = None,
@@ -275,6 +277,7 @@ class Trainer:
         self.val_batch_size = val_batch_size
         self.label_metadata = label_metadata
         self.log_dir = log_dir
+        self.loss_fn = loss_fn
         self.train_downscale = train_downscale
         self.mixed_precision = mixed_precision
         self.checkpoint_metadata = checkpoint_metadata or {}
@@ -415,9 +418,7 @@ class Trainer:
         return images, labels
 
     def _loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        return F.cross_entropy(
-            logits, labels, ignore_index=self.label_metadata.ignore_id
-        )
+        return self.loss_fn(logits, labels, self.label_metadata.ignore_id)
 
     @torch.no_grad()
     def _val_step(
@@ -732,6 +733,7 @@ class TrainingConfig:
     level_count: int | None = None
 
     learning_rate: float = 1e-4
+    loss_fn_name: str = "cross_entropy"
 
     log_dir: Path | None = None
 
@@ -741,6 +743,9 @@ class TrainingConfig:
         assert self.log_every_n_datapoints % self.train_batch_size == 0, (
             f"{self.train_batch_size=} must divide "
             f"{self.log_every_n_datapoints=}."
+        )
+        assert callable(getattr(metrics, self.loss_fn_name, None)), (
+            f"{self.loss_fn_name=} isn't a function in metrics.py."
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -874,6 +879,7 @@ def train_unet_on_cityscapes(config: TrainingConfig) -> UNet:
             val_batch_size=config.val_batch_size,
             label_metadata=label_metadata,
             log_dir=config.log_dir,
+            loss_fn=getattr(metrics, config.loss_fn_name),
             checkpoint_metadata=checkpoint_metadata,
         )
 
@@ -906,11 +912,12 @@ if __name__ == "__main__":
     train_unet_on_cityscapes(
         TrainingConfig(
             dataset_class=CityscapesPersonLabeledDataset,
-            train_datapoint_count=200_000,  # About 67 epochs of the ~2,975 finely labeled training datapoints.
+            train_datapoint_count=300_000,  # About 100 epochs of the ~2,975 finely labeled training datapoints.
             val_datapoint_count=None,  # Use all 500 labeled datapoints each time.
             train_batch_size=8,
             val_batch_size=1,
             init_checkpoint_path=None,
+            loss_fn_name="left_piecewise_linear_cross_entropy",
             log_every_n_datapoints=10_000,
             log_dir=(
                 DEFAULT_RUNS_DIR
