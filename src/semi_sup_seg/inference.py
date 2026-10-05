@@ -2,17 +2,53 @@
 Module to support running inference with segmentation models.
 """
 
+import dataclasses
 import logging
 
 import torch
 from torch import nn
 
-from semi_sup_seg.config import PseudoLabelingConfig
 from semi_sup_seg.data.labels import LabelMetadata
 from semi_sup_seg.models import UNet
 from semi_sup_seg.precision import DEFAULT_MIXED_PRECISION, autocast
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PseudoLabelingConfig:
+    """
+    Settings for pseudo-labeling: using an existing model to make labels.
+    """
+
+    # fmt: off
+    warmup_datapoints_before_pseudo_labeling: int = 300_000
+    labeled_to_unlabeled_ratio: tuple[int, int] = (1, 7)
+    labeled_and_unlabeled_loss_multipliers: tuple[float, float] = (4/1, 4/7)
+
+    teacher_lag: int = 10_000
+    teacher_min_confidence: float = 0.60
+    # fmt: on
+
+    def __post_init__(self) -> None:
+        if not (
+            0
+            <= self.teacher_lag
+            <= self.warmup_datapoints_before_pseudo_labeling
+        ):
+            raise ValueError(
+                f"{self.teacher_lag=} must be in "
+                f"[0, {self.warmup_datapoints_before_pseudo_labeling=}]."
+            )
+        if min(self.labeled_and_unlabeled_loss_multipliers) < 0:
+            raise ValueError(
+                f"{self.labeled_and_unlabeled_loss_multipliers=} must be "
+                "non-negative."
+            )
+        if not 0 <= self.teacher_min_confidence < 1:
+            raise ValueError(
+                f"{self.teacher_min_confidence=} must be in [0, 1)."
+            )
 
 
 class PseudoLabeler:
@@ -35,7 +71,9 @@ class PseudoLabeler:
         self.device = next(model.parameters()).device
 
         # Predicted class --> training label.
-        self.label_map = label_metadata.get_train_label_map().to(self.device)
+        self.label_map = label_metadata.get_filter_to_eval_labels_map().to(
+            self.device
+        )
 
         # Train datapoints seen --> CPU copy of the student's state then.
         self.teacher_candidate_states: dict[int, dict[str, torch.Tensor]] = {}

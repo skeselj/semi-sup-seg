@@ -14,27 +14,22 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
 
 from semi_sup_seg.constants import CITYSCAPES_DIR
-from semi_sup_seg.data import (
-    DEFAULT_WORKER_COUNT,
+from semi_sup_seg.data.cityscapes import (
     CityscapesLabeledDataset,
     CityscapesUnlabeledDataset,
-    get_cityscapes_datapoint_index_iter,
+)
+from semi_sup_seg.data.datapoints import DEFAULT_WORKER_COUNT
+from semi_sup_seg.data.images import (
+    load_image,
+    load_label,
+    write_png_atomically,
 )
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_LOG_EVERY_N = 500
-
-
-def _write_png_atomically(array: np.ndarray, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    temporary_path = path.with_name(f"{path.name}.tmp")
-    Image.fromarray(array).save(temporary_path, format="PNG")
-    temporary_path.replace(path)
 
 
 def downsample_image(
@@ -50,7 +45,8 @@ def downsample_image(
 
     f = downsample_factor
 
-    image = np.array(Image.open(input_image_path).convert("RGB"))
+    # Copied, as `torch.from_numpy` warns on read-only arrays.
+    image = np.array(load_image(input_image_path))
 
     # Triangle weights at offsets -(f-1)..(f-1), e.g. [1, 2, 1] / 4 for f = 2.
     tent = 1 - torch.arange(-(f - 1), f).abs() / f
@@ -64,7 +60,7 @@ def downsample_image(
 
     downsampled = x[:, 0].permute(1, 2, 0).round().clamp(0, 255).to(torch.uint8)
 
-    _write_png_atomically(downsampled.numpy(), Path(output_image_path))
+    write_png_atomically(downsampled.numpy(), Path(output_image_path))
 
 
 def downsample_label(
@@ -78,12 +74,12 @@ def downsample_label(
     Done in a way that aligns with `downsample_image`.
     """
 
-    label = np.asarray(Image.open(input_label_path))
+    label = load_label(input_label_path)
     downsampled = np.ascontiguousarray(
         label[::downsample_factor, ::downsample_factor]
     )
 
-    _write_png_atomically(downsampled, Path(output_label_path))
+    write_png_atomically(downsampled, Path(output_label_path))
 
 
 # (downsampling function, input path, output path), per file to write.
@@ -139,11 +135,17 @@ def write_downsampled_cityscapes_labeled_dataset(
     output_image_dir: str | Path,
     output_label_dir: str | Path,
     downsample_factor: int,
+    splits: tuple[str, ...] = (
+        "train",
+        "train_extra",
+        "val",
+        "test",
+    ),  # IS-OOS splits.
     force: bool = False,  # Overwrite existing files, instead of skipping them.
     worker_count: int = DEFAULT_WORKER_COUNT,
 ) -> None:
     """
-    Write downsampled copies of every finely labeled (image, label) pair.
+    Write downsampled copies of every (image, label) pair in `splits`.
 
     Outputs mirror the inputs' directory layout & file names, so
     `CityscapesLabeledDataset(output_image_dir, output_label_dir)` reads them.
@@ -154,29 +156,26 @@ def write_downsampled_cityscapes_labeled_dataset(
     output_image_dir = Path(output_image_dir)
     output_label_dir = Path(output_label_dir)
 
-    labeled_dataset = CityscapesLabeledDataset(
-        image_dir=input_image_dir, fine_label_dir=input_label_dir
-    )
-    datapoints = list(
-        get_cityscapes_datapoint_index_iter(
-            labeled_dataset.fine_datapoint_index
-        )
-    )
+    datapoints = CityscapesLabeledDataset(
+        image_dir=input_image_dir,
+        label_dir=input_label_dir,
+        selected_is_oos_splits=splits,
+    ).get_datapoints()
 
     jobs: list[_Job] = []
     for dp in datapoints:
         jobs.append(
             (
                 downsample_image,
-                dp.image.path,
-                output_image_dir / dp.image.path.relative_to(input_image_dir),
+                dp.image_path,
+                output_image_dir / dp.image_path.relative_to(input_image_dir),
             )
         )
         jobs.append(
             (
                 downsample_label,
-                dp.label.path,
-                output_label_dir / dp.label.path.relative_to(input_label_dir),
+                dp.label_path,
+                output_label_dir / dp.label_path.relative_to(input_label_dir),
             )
         )
 
@@ -187,7 +186,7 @@ def write_downsampled_cityscapes_unlabeled_dataset(
     input_image_dir: str | Path,
     output_image_dir: str | Path,
     downsample_factor: int,
-    splits: tuple[str, ...] = ("train",),  # IS-OOS splits to write.
+    splits: tuple[str, ...] = ("train", "val"),  # IS-OOS splits to write.
     force: bool = False,  # Overwrite existing files, instead of skipping them.
     worker_count: int = DEFAULT_WORKER_COUNT,
 ) -> None:
@@ -201,18 +200,17 @@ def write_downsampled_cityscapes_unlabeled_dataset(
     input_image_dir = Path(input_image_dir)
     output_image_dir = Path(output_image_dir)
 
-    unlabeled_dataset = CityscapesUnlabeledDataset(image_dir=input_image_dir)
-    datapoints = list(
-        get_cityscapes_datapoint_index_iter(
-            unlabeled_dataset.image_index, selected_is_oos_splits=list(splits)
-        )
-    )
+    datapoints = CityscapesUnlabeledDataset(
+        image_dir=input_image_dir,
+        selected_is_oos_splits=splits,
+        keep_every_nth_frame=1,
+    ).get_datapoints()
 
     jobs: list[_Job] = [
         (
             downsample_image,
-            dp.image.path,
-            output_image_dir / dp.image.path.relative_to(input_image_dir),
+            dp.image_path,
+            output_image_dir / dp.image_path.relative_to(input_image_dir),
         )
         for dp in datapoints
     ]
@@ -234,10 +232,9 @@ if __name__ == "__main__":
         output_image_dir=CITYSCAPES_DIR / "leftImg8bit_2x_downsampled",
         output_label_dir=CITYSCAPES_DIR / "gtFine_2x_downsampled",
         downsample_factor=2,
-        force=True,
     )
-    # write_downsampled_cityscapes_unlabeled_dataset(
-    #     input_image_dir=CITYSCAPES_DIR / "leftImg8bit_sequence",
-    #     output_image_dir=CITYSCAPES_DIR / "leftImg8bit_sequence_2x_downsampled",
-    #     downsample_factor=2,
-    # )
+    write_downsampled_cityscapes_unlabeled_dataset(
+        input_image_dir=CITYSCAPES_DIR / "leftImg8bit_sequence",
+        output_image_dir=CITYSCAPES_DIR / "leftImg8bit_sequence_2x_downsampled",
+        downsample_factor=2,
+    )

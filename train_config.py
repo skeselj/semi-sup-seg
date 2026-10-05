@@ -1,5 +1,5 @@
 """
-Module to support configuring trainings.
+Module to support configuring trainings, for train.py.
 """
 
 import dataclasses
@@ -8,12 +8,13 @@ from typing import Any
 
 from semi_sup_seg import losses
 from semi_sup_seg.constants import CITYSCAPES_DIR, DEFAULT_SEED
-from semi_sup_seg.data import (
+from semi_sup_seg.data.augmentation import AugmentationSampler
+from semi_sup_seg.data.cityscapes import (
     CityscapesLabeledDataset,
     CityscapesPersonLabeledDataset,
     CityscapesUnlabeledDataset,
 )
-from semi_sup_seg.data.aug import AugmentationSampler
+from semi_sup_seg.inference import PseudoLabelingConfig
 from semi_sup_seg.models import UNet
 
 DEFAULT_BASE_HEIGHT = 256
@@ -22,11 +23,13 @@ DEFAULT_BASE_WIDTH = 512
 
 def _to_plain(value: Any) -> Any:
     """
-    Convert classes to their names & paths to strings, recursively.
+    Convert classes & paths to strs, inside any dicts, lists & tuples.
     """
 
     if isinstance(value, dict):
         return {key: _to_plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_to_plain(item) for item in value)
     if isinstance(value, type):
         return value.__name__
     if isinstance(value, Path):
@@ -36,65 +39,30 @@ def _to_plain(value: Any) -> Any:
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class LabeledDataConfig:
-    """
-    Settings for the labeled data: where it is.
-    """
-
     # fmt: off
     dataset_class: type[CityscapesLabeledDataset] = CityscapesLabeledDataset
     image_dir: Path = CITYSCAPES_DIR / "leftImg8bit_2x_downsampled"
-    fine_label_dir: Path = CITYSCAPES_DIR / "gtFine_2x_downsampled"
+    label_dir: Path = CITYSCAPES_DIR / "gtFine_2x_downsampled"
+    train_is_oos_splits: tuple[str, ...] = ("train",)
+    val_is_oos_splits: tuple[str, ...] = ("val",)
     # fmt: on
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class PseudoLabelingConfig:
-    """
-    Settings for pseudo-labeling: using an existing model to make labels.
-    """
-
+class UnlabeledDataConfig:
     # fmt: off
-    unlabeled_dataset_class: type[CityscapesUnlabeledDataset] = CityscapesUnlabeledDataset
-    unlabeled_image_dir: Path = CITYSCAPES_DIR / "leftImg8bit_sequence_2x_downsampled"
-    unlabeled_keep_every_nth_frame: int = 2
-
-    warmup_datapoints_before_pseudo_labeling: int = 300_000
-    labeled_to_unlabeled_ratio: tuple[int, int] = (1, 7)
-    labeled_and_unlabeled_loss_multipliers: tuple[float, float] = (4/1, 4/7)
-
-    teacher_lag: int = 10_000
-    teacher_min_confidence: float = 0.60
+    dataset_class: type[CityscapesUnlabeledDataset] = CityscapesUnlabeledDataset
+    image_dir: Path = CITYSCAPES_DIR / "leftImg8bit_sequence_2x_downsampled"
+    is_oos_splits: tuple[str, ...] = ("train",)
+    keep_every_nth_frame: int = 2
     # fmt: on
-
-    def __post_init__(self) -> None:
-        if not (
-            0
-            <= self.teacher_lag
-            <= self.warmup_datapoints_before_pseudo_labeling
-        ):
-            raise ValueError(
-                f"{self.teacher_lag=} must be in "
-                f"[0, {self.warmup_datapoints_before_pseudo_labeling=}]."
-            )
-        if min(self.labeled_and_unlabeled_loss_multipliers) < 0:
-            raise ValueError(
-                f"{self.labeled_and_unlabeled_loss_multipliers=} must be "
-                "non-negative."
-            )
-        if not 0 <= self.teacher_min_confidence < 1:
-            raise ValueError(
-                f"{self.teacher_min_confidence=} must be in [0, 1)."
-            )
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class TrainingConfig:
-    """
-    Settings for training a model.
-    """
-
     # fmt: off
     labeled_data: LabeledDataConfig
+    unlabeled_data: UnlabeledDataConfig | None = None
     pseudo_labeling: PseudoLabelingConfig | None = None
     augmentation_sampler: AugmentationSampler | None = None
 
@@ -130,6 +98,12 @@ class TrainingConfig:
                 f"{self.loss_fn_name=} must be one of {list(losses.LOSS_FNS)}."
             )
 
+        if (self.unlabeled_data is None) != (self.pseudo_labeling is None):
+            raise ValueError(
+                f"{self.unlabeled_data=} must be set exactly when "
+                f"{self.pseudo_labeling=} is."
+            )
+
         pseudo_labeling = self.pseudo_labeling
         if pseudo_labeling is None:
             return
@@ -155,10 +129,6 @@ class TrainingConfig:
                 )
 
     def to_dict(self) -> dict[str, Any]:
-        """
-        Get these settings as plain values, e.g. classes as their names.
-        """
-
         return _to_plain(dataclasses.asdict(self))
 
 
@@ -207,8 +177,21 @@ def get_unet_config(
     return config
 
 
-# Preset name --> settings of that kind of training, except where it logs.
 TRAINING_PRESETS: dict[str, TrainingConfig] = {
+    "plain_supervised_small": TrainingConfig(
+        labeled_data=LabeledDataConfig(
+            dataset_class=CityscapesPersonLabeledDataset
+        ),
+        augmentation_sampler=None,
+        pseudo_labeling=None,
+        train_datapoint_count=100_000,
+        val_datapoint_count=None,
+        train_batch_size=8,
+        val_batch_size=1,
+        init_checkpoint_path=None,
+        learning_rate=1e-4,
+        log_every_n_datapoints=2_000,
+    ),
     "plain_supervised": TrainingConfig(
         labeled_data=LabeledDataConfig(
             dataset_class=CityscapesPersonLabeledDataset
@@ -242,6 +225,7 @@ TRAINING_PRESETS: dict[str, TrainingConfig] = {
             dataset_class=CityscapesPersonLabeledDataset
         ),
         augmentation_sampler=AugmentationSampler(),
+        unlabeled_data=UnlabeledDataConfig(),
         pseudo_labeling=PseudoLabelingConfig(
             warmup_datapoints_before_pseudo_labeling=50_000,
             labeled_to_unlabeled_ratio=(1, 7),
@@ -253,7 +237,9 @@ TRAINING_PRESETS: dict[str, TrainingConfig] = {
         val_datapoint_count=None,
         train_batch_size=8,
         val_batch_size=1,
-        init_checkpoint_path=Path("./logs/runs/oct_04_evening_augmented_supervised_unet_cityscapes_20261004_215123/checkpoint_0950000.pt"),
+        init_checkpoint_path=Path(
+            "./logs/runs/oct_04_evening_augmented_supervised_unet_cityscapes_20261004_215123/checkpoint_0950000.pt"
+        ),
         learning_rate=1e-5,
         log_every_n_datapoints=10_000,
     ),

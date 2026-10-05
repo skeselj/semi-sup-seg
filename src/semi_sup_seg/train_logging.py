@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 from semi_sup_seg.constants import MAX_LABEL_COUNT, MAX_PIXEL_INT_VALUE
-from semi_sup_seg.data.aug import Augmentation
+from semi_sup_seg.data.augmentation import Augmentation
 from semi_sup_seg.data.labels import LabelMetadata
 
 logger = logging.getLogger(__name__)

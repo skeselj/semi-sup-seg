@@ -20,17 +20,17 @@ from semi_sup_seg.checkpoints import (
     get_init_checkpoint_metadata,
     load_unet_checkpoint,
 )
-from semi_sup_seg.config import (
-    TRAINING_PRESETS,
-    TrainingConfig,
-    get_unet_config,
-)
 from semi_sup_seg.constants import (
     DEFAULT_RUNS_DIR,
 )
 from semi_sup_seg.inference import PseudoLabeler
 from semi_sup_seg.models import UNet
 from semi_sup_seg.trainer import Trainer
+from train_config import (
+    TRAINING_PRESETS,
+    TrainingConfig,
+    get_unet_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,22 +49,29 @@ def train_unet_on_cityscapes(config: TrainingConfig) -> UNet:
     torch.backends.cudnn.benchmark = True
 
     labeled_data = config.labeled_data
-    labeled_dataset = labeled_data.dataset_class(
-        image_dir=labeled_data.image_dir,
-        fine_label_dir=labeled_data.fine_label_dir,
-        seed=config.seed,
+    labeled_train_dataset, labeled_val_dataset = (
+        labeled_data.dataset_class(
+            image_dir=labeled_data.image_dir,
+            label_dir=labeled_data.label_dir,
+            selected_is_oos_splits=is_oos_splits,
+            seed=config.seed,
+        )
+        for is_oos_splits in (
+            labeled_data.train_is_oos_splits,
+            labeled_data.val_is_oos_splits,
+        )
     )
-    label_metadata = labeled_dataset.LABEL_METADATA
-    labeled_train_data_iter = labeled_dataset.iter_fine_train_datapoints(
-        num_datapoints=config.train_datapoint_count
+    label_metadata = labeled_train_dataset.LABEL_METADATA
+    labeled_train_data_iter = labeled_train_dataset.iter_loaded_datapoints(
+        num_datapoints=config.train_datapoint_count, shuffle=True
     )
     labeled_val_data_iter = itertools.chain.from_iterable(
-        labeled_dataset.iter_fine_val_datapoints(shuffle=True)
+        labeled_val_dataset.iter_loaded_datapoints(shuffle=True)
         for _ in itertools.count()
     )
     val_datapoint_count = config.val_datapoint_count
     if val_datapoint_count is None:
-        val_datapoint_count = labeled_dataset.get_fine_val_datapoint_count()
+        val_datapoint_count = labeled_val_dataset.get_datapoint_count()
 
     init_model, init_checkpoint = None, None
     init_checkpoint_path = config.init_checkpoint_path
@@ -107,9 +114,11 @@ def train_unet_on_cityscapes(config: TrainingConfig) -> UNet:
             )
 
             pseudo_labeling = config.pseudo_labeling
+            unlabeled_data = config.unlabeled_data
             pseudo_labeler, unlabeled_train_data_iter = None, None
             unlabeled_image_size = None
-            if pseudo_labeling is not None:
+
+            if pseudo_labeling is not None and unlabeled_data is not None:
                 teacher = UNet(**unet_config).to(device)
                 if os.environ.get("COMPILE_MODEL", "1") != "0":
                     teacher.compile()
@@ -117,34 +126,34 @@ def train_unet_on_cityscapes(config: TrainingConfig) -> UNet:
                     teacher, label_metadata, pseudo_labeling
                 )
 
-                unlabeled_dataset = pseudo_labeling.unlabeled_dataset_class(
-                    image_dir=pseudo_labeling.unlabeled_image_dir,
+                unlabeled_dataset = unlabeled_data.dataset_class(
+                    image_dir=unlabeled_data.image_dir,
+                    selected_is_oos_splits=unlabeled_data.is_oos_splits,
+                    keep_every_nth_frame=unlabeled_data.keep_every_nth_frame,
                     seed=config.seed,
-                    keep_every_nth_frame=(
-                        pseudo_labeling.unlabeled_keep_every_nth_frame
-                    ),
                 )
                 unlabeled_image_size = unlabeled_dataset.get_image_size()
                 unlabeled_train_data_iter = (
-                    unlabeled_dataset.iter_train_datapoints(
-                        num_datapoints=config.train_datapoint_count
+                    unlabeled_dataset.iter_loaded_datapoints(
+                        num_datapoints=config.train_datapoint_count,
+                        shuffle=True,
                     )
                 )
 
         trainer = Trainer(
-            labeled_image_size=labeled_dataset.get_image_size(),
+            labeled_image_size=labeled_train_dataset.get_image_size(),
             labeled_train_data_iter=labeled_train_data_iter,
             labeled_val_data_iter=labeled_val_data_iter,
+            unlabeled_train_data_iter=unlabeled_train_data_iter,
+            unlabeled_image_size=unlabeled_image_size,
             train_batch_size=config.train_batch_size,
             val_batch_size=config.val_batch_size,
             label_metadata=label_metadata,
-            log_dir=config.log_dir,
-            loss_fn=losses.LOSS_FNS[config.loss_fn_name],
-            augmentation_sampler=config.augmentation_sampler,
-            checkpoint_metadata=checkpoint_metadata,
             pseudo_labeler=pseudo_labeler,
-            unlabeled_train_data_iter=unlabeled_train_data_iter,
-            unlabeled_image_size=unlabeled_image_size,
+            augmentation_sampler=config.augmentation_sampler,
+            loss_fn=losses.LOSS_FNS[config.loss_fn_name],
+            log_dir=config.log_dir,
+            checkpoint_metadata=checkpoint_metadata,
         )
 
         with profiler.phase("warm up", on_gpu=True):
@@ -175,11 +184,11 @@ if __name__ == "__main__":
     preset, label = sys.argv[1:]
 
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s: %(message)s",
     )
+
     start_time = datetime.now().astimezone()
     train_unet_on_cityscapes(
         dataclasses.replace(

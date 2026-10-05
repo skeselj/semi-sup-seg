@@ -18,10 +18,10 @@ TensorDatapointIter = Iterator[tuple[torch.Tensor, torch.Tensor]]
 
 
 def iter_shuffled(
-    items: list[T], rng: np.random.Generator, count: int
+    items: list[T], count: int, rng: np.random.Generator
 ) -> Iterator[T]:
     """
-    Yield `count` of `items`, reshuffling `items` after each pass over them.
+    Yield `count` elements from `items`, reshuffling `items` after each pass.
     """
 
     if not items and count > 0:
@@ -86,24 +86,3 @@ def prefetch(
             yield item
     finally:
         stop_event.set()
-
-
-def batch(
-    data_iter: Iterator[tuple[np.ndarray, ...]], batch_size: int
-) -> Iterator[tuple[torch.Tensor, ...]]:
-    """
-    Yield batches of loaded datapoints, e.g. uint8 (B, H, W, 3) image and
-    (B, H, W) label batches.
-    """
-
-    pin = torch.cuda.is_available()
-
-    while datapoints := list(itertools.islice(data_iter, batch_size)):
-        tensors = tuple(
-            torch.from_numpy(np.stack(arrays)) for arrays in zip(*datapoints)
-        )
-
-        if pin:
-            tensors = tuple(tensor.pin_memory() for tensor in tensors)
-
-        yield tensors

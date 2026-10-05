@@ -9,15 +9,15 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 from profiler import profiler, torch_profile
 from torch import nn
 
 from semi_sup_seg.checkpoints import get_checkpoint_file_name, save_checkpoint
 from semi_sup_seg.constants import MAX_PIXEL_INT_VALUE
-from semi_sup_seg.data import TensorDatapointIter, batch, prefetch
-from semi_sup_seg.data.aug import Augmentation, AugmentationSampler
+from semi_sup_seg.data.augmentation import Augmentation, AugmentationSampler
+from semi_sup_seg.data.datapoints import LoadedDatapoint, batch_datapoints
+from semi_sup_seg.data.iteration import TensorDatapointIter, prefetch
 from semi_sup_seg.data.labels import LabelMetadata
 from semi_sup_seg.inference import PseudoLabeler
 from semi_sup_seg.metrics import (
@@ -58,9 +58,9 @@ class Trainer:
         self,
         *,
         labeled_image_size: tuple[int, int],
-        labeled_train_data_iter: Iterator[tuple[np.ndarray, np.ndarray]],
-        labeled_val_data_iter: Iterator[tuple[np.ndarray, np.ndarray]],
-        unlabeled_train_data_iter: Iterator[tuple[np.ndarray]] | None = None,
+        labeled_train_data_iter: Iterator[LoadedDatapoint],
+        labeled_val_data_iter: Iterator[LoadedDatapoint],
+        unlabeled_train_data_iter: Iterator[LoadedDatapoint] | None = None,
         unlabeled_image_size: tuple[int, int] | None = None,
         label_metadata: LabelMetadata,
         pseudo_labeler: PseudoLabeler | None = None,
@@ -97,7 +97,7 @@ class Trainer:
         ):
             raise ValueError("Pseudo-labeling needs unlabeled train data.")
 
-        self.label_map = label_metadata.get_raw_train_label_map()
+        self.label_map = label_metadata.get_raw_to_train_label_map()
 
         # Scales loss before backward, so fp16 grads don't underflow, then
         # unscales before optimizer step.
@@ -148,7 +148,7 @@ class Trainer:
 
     def _iterate_data(
         self,
-        data_iter: Iterator[tuple[np.ndarray, ...]],
+        data_iter: Iterator[LoadedDatapoint],
         datapoint_count: int,
         batch_size: int,
         profile_phase: str = "load raw data",
@@ -162,7 +162,9 @@ class Trainer:
 
         remaining = datapoint_count
         iterator = prefetch(
-            batch(itertools.islice(data_iter, datapoint_count), batch_size)
+            batch_datapoints(
+                itertools.islice(data_iter, datapoint_count), batch_size
+            )
         )
 
         while True:
