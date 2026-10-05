@@ -126,12 +126,7 @@ def train_unet_on_cityscapes(config: TrainingConfig) -> UNet:
                     teacher, label_metadata, pseudo_labeling
                 )
 
-                unlabeled_dataset = unlabeled_data.dataset_class(
-                    image_dir=unlabeled_data.image_dir,
-                    selected_is_oos_splits=unlabeled_data.is_oos_splits,
-                    keep_every_nth_frame=unlabeled_data.keep_every_nth_frame,
-                    seed=config.seed,
-                )
+                unlabeled_dataset = unlabeled_data.build_dataset(config.seed)
                 unlabeled_image_size = unlabeled_dataset.get_image_size()
                 unlabeled_train_data_iter = (
                     unlabeled_dataset.iter_loaded_datapoints(

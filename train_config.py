@@ -14,6 +14,7 @@ from semi_sup_seg.data.cityscapes import (
     CityscapesPersonLabeledDataset,
     CityscapesUnlabeledDataset,
 )
+from semi_sup_seg.data.datasets import Dataset, MixtureDataset
 from semi_sup_seg.inference import PseudoLabelingConfig
 from semi_sup_seg.models import UNet
 
@@ -49,13 +50,46 @@ class LabeledDataConfig:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class UnlabeledDataConfig:
+class PlainUnlabeledDataConfig:
     # fmt: off
     dataset_class: type[CityscapesUnlabeledDataset] = CityscapesUnlabeledDataset
     image_dir: Path = CITYSCAPES_DIR / "leftImg8bit_sequence_2x_downsampled"
     is_oos_splits: tuple[str, ...] = ("train",)
     keep_every_nth_frame: int = 2
     # fmt: on
+
+    def build_dataset(self, seed: int) -> Dataset:
+        return self.dataset_class(
+            image_dir=self.image_dir,
+            selected_is_oos_splits=self.is_oos_splits,
+            keep_every_nth_frame=self.keep_every_nth_frame,
+            seed=seed,
+        )
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class MixtureUnlabeledDataConfig:
+    config_to_weight: tuple[tuple[PlainUnlabeledDataConfig, float], ...]
+
+    def __post_init__(self) -> None:
+        if not self.config_to_weight:
+            raise ValueError("A mixture needs at least one config.")
+        if min(weight for _, weight in self.config_to_weight) <= 0:
+            raise ValueError(
+                f"{self.config_to_weight=} weights must be positive."
+            )
+
+    def build_dataset(self, seed: int) -> Dataset:
+        return MixtureDataset(
+            [
+                (config.build_dataset(seed), weight)
+                for config, weight in self.config_to_weight
+            ],
+            seed=seed,
+        )
+
+
+UnlabeledDataConfig = PlainUnlabeledDataConfig | MixtureUnlabeledDataConfig
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -177,6 +211,7 @@ def get_unet_config(
     return config
 
 
+# fmt: off
 TRAINING_PRESETS: dict[str, TrainingConfig] = {
     "plain_supervised_small": TrainingConfig(
         labeled_data=LabeledDataConfig(
@@ -221,11 +256,9 @@ TRAINING_PRESETS: dict[str, TrainingConfig] = {
         log_every_n_datapoints=10_000,
     ),
     "augmented_semisupervised": TrainingConfig(
-        labeled_data=LabeledDataConfig(
-            dataset_class=CityscapesPersonLabeledDataset
-        ),
+        labeled_data=LabeledDataConfig(dataset_class=CityscapesPersonLabeledDataset),
         augmentation_sampler=AugmentationSampler(),
-        unlabeled_data=UnlabeledDataConfig(),
+        unlabeled_data=PlainUnlabeledDataConfig(),
         pseudo_labeling=PseudoLabelingConfig(
             warmup_datapoints_before_pseudo_labeling=50_000,
             labeled_to_unlabeled_ratio=(1, 7),
@@ -237,10 +270,33 @@ TRAINING_PRESETS: dict[str, TrainingConfig] = {
         val_datapoint_count=None,
         train_batch_size=8,
         val_batch_size=1,
-        init_checkpoint_path=Path(
-            "./logs/runs/oct_04_evening_augmented_supervised_unet_cityscapes_20261004_215123/checkpoint_0950000.pt"
+        init_checkpoint_path=Path("./logs/runs/oct_04_evening_augmented_supervised_unet_cityscapes_20261004_215123/checkpoint_0950000.pt"),
+        learning_rate=1e-5,
+        log_every_n_datapoints=10_000,
+    ),
+    "augmented_semisupervised_mixture": TrainingConfig(
+        labeled_data=LabeledDataConfig(dataset_class=CityscapesPersonLabeledDataset),
+        augmentation_sampler=AugmentationSampler(),
+        unlabeled_data=MixtureUnlabeledDataConfig(
+            config_to_weight=(
+                (PlainUnlabeledDataConfig(is_oos_splits=("train",), keep_every_nth_frame=3), 2 / 6),
+                (PlainUnlabeledDataConfig(is_oos_splits=("val",), keep_every_nth_frame=1), 4 / 6),
+            ),
         ),
+        pseudo_labeling=PseudoLabelingConfig(
+            warmup_datapoints_before_pseudo_labeling=50_000,
+            labeled_to_unlabeled_ratio=(2, 6),
+            labeled_and_unlabeled_loss_multipliers=(4 / 2, 4 / 6),
+            teacher_lag=50_000,
+            teacher_min_confidence=0.60,
+        ),
+        train_datapoint_count=3_000_000,
+        val_datapoint_count=None,
+        train_batch_size=8,
+        val_batch_size=1,
+        init_checkpoint_path=Path("./logs/runs/oct_04_evening_augmented_supervised_unet_cityscapes_20261004_215123/checkpoint_0950000.pt"),
         learning_rate=1e-5,
         log_every_n_datapoints=10_000,
     ),
 }
+# fmt: on
