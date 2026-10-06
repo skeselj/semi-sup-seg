@@ -1,8 +1,8 @@
 """
-Definitions of one-off pipelines.
+Pipeline to write downsampled copies of datasets.
 
 Example usage:
-python pipelines.py
+python pipelines/dataset_downsampling.py
 """
 
 import logging

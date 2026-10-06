@@ -2,7 +2,7 @@
 Script to train segmentation models on datasets.
 
 Example usage:
-PROFILE_RESOURCES=1 PROFILE_RESOURCES_TORCH=1 python train.py $PRESET $LABEL
+PROFILE_RESOURCES=1 PROFILE_RESOURCES_TORCH=1 python training_entrypoints/train.py $PRESET $LABEL
 """
 
 import dataclasses

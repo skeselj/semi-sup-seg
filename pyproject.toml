@@ -17,4 +17,4 @@ required-version = "0.16.6"
 target-version = "py311"
 line-length = 80
 # Where first-party code is, for import sorting.
-src = [".", "src"]
+src = [".", "src", "training_entrypoints", "pipelines"]
