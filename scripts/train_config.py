@@ -217,7 +217,7 @@ def get_unet_config(
 
 # fmt: off
 TRAINING_PRESETS: dict[str, TrainingConfig] = {
-    "plain_supervised": TrainingConfig(
+    "sup": TrainingConfig(
         labeled_data=LabeledDataConfig(
             dataset_class=CityscapesPersonLabeledDataset,
             train_is_oos_splits=("alpine",),
@@ -233,7 +233,7 @@ TRAINING_PRESETS: dict[str, TrainingConfig] = {
         learning_rate=1e-4,
         log_every_n_datapoints=2_000,
     ),
-    "augmented_supervised": TrainingConfig(
+    "aug_sup": TrainingConfig(
         labeled_data=LabeledDataConfig(
             dataset_class=CityscapesPersonLabeledDataset,
             train_is_oos_splits=("southern",),
@@ -249,7 +249,7 @@ TRAINING_PRESETS: dict[str, TrainingConfig] = {
         learning_rate=1e-4,
         log_every_n_datapoints=5_000,
     ),
-    "augmented_semisupervised": TrainingConfig(
+    "semi_sup": TrainingConfig(
         labeled_data=LabeledDataConfig(
             dataset_class=CityscapesPersonLabeledDataset,
             train_is_oos_splits=("southern",),
@@ -261,10 +261,10 @@ TRAINING_PRESETS: dict[str, TrainingConfig] = {
             keep_every_nth_frame=2,
         ),
         pseudo_labeling=PseudoLabelingConfig(
-            warmup_datapoints_before_pseudo_labeling=10_000,
+            warmup_datapoints_before_pseudo_labeling=200_000,
             labeled_to_unlabeled_ratio=(2, 6),
             labeled_and_unlabeled_loss_multipliers=(4 / 2, 4 / 6),
-            teacher_lag=10_000,
+            teacher_lag=50_000,
             teacher_ema_decay=0.9,
             teacher_min_confidence=0.60,
         ),
@@ -273,7 +273,7 @@ TRAINING_PRESETS: dict[str, TrainingConfig] = {
         val_datapoint_count=None,
         train_batch_size=8,
         val_batch_size=1,
-        init_checkpoint_path=Path("/home/stefan/hdd/projects/semi-sup-seg/logs/runs/southern_split_augmented_supervised_unet_cityscapes_20261006_075451/checkpoint_100000.pt"),
+        init_checkpoint_path=None,
         learning_rate=1e-4,
         log_every_n_datapoints=10_000,
     )

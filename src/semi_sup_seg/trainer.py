@@ -28,7 +28,8 @@ from semi_sup_seg.metrics import (
 from semi_sup_seg.precision import DEFAULT_MIXED_PRECISION, autocast
 from semi_sup_seg.train_logging import (
     DEFAULT_LOG_EVERY_N,
-    DEFAULT_LOG_IMAGE_COUNT,
+    DEFAULT_TRAIN_LOG_IMAGE_COUNT,
+    DEFAULT_VAL_LOG_IMAGE_COUNT,
     TrainingLogger,
 )
 
@@ -393,7 +394,7 @@ class Trainer:
         datapoint_count: int,
         log_train_datapoints_seen: int,
         log_train_total_datapoint_count: int,
-        log_image_count: int = DEFAULT_LOG_IMAGE_COUNT,
+        log_image_count: int = DEFAULT_VAL_LOG_IMAGE_COUNT,
     ) -> dict[str, float] | None:
         """
         Validate `model` w.r.t. `datapoint_count` sampled val datapoints.
@@ -405,6 +406,8 @@ class Trainer:
         datapoints_seen = 0
         datapoint_losses: list[torch.Tensor] = []
         confusion = get_empty_confusion_matrix(self.label_metadata, device)
+        batches_to_log: list[tuple[torch.Tensor, ...]] = []
+        logged_image_count = 0
 
         try:
             model.eval()
@@ -412,8 +415,6 @@ class Trainer:
             for image_batch, label_batch in self._iterate_val_data(
                 datapoint_count
             ):
-                is_logging_step = datapoints_seen == 0
-
                 with profiler.phase("infer on val batch", on_gpu=True):
                     images, labels, logits, batch_losses = self._val_step(
                         model, image_batch, label_batch, device
@@ -425,12 +426,17 @@ class Trainer:
                         labels, logits.argmax(dim=1), self.label_metadata
                     )
 
-                if not is_logging_step:
-                    continue
+                if logged_image_count < log_image_count:
+                    batches_to_log.append((images, labels, logits))
+                    logged_image_count += len(images)
 
+            if batches_to_log:
                 with profiler.phase("log for val batch"):
+                    images, labels, logits = (
+                        torch.cat(tensors) for tensors in zip(*batches_to_log)
+                    )
                     self.training_logger.log_images(
-                        log_base_name="val",
+                        log_base_name="03_quality_samples/val",
                         datapoints_seen=log_train_datapoints_seen,
                         images=images,
                         labels=labels,
@@ -444,10 +450,10 @@ class Trainer:
             return None
 
         with profiler.phase("log for val batch"):
+            all_losses = torch.cat(datapoint_losses).float()
             metrics = compute_public_benchmark_metrics(
                 confusion, self.label_metadata
             )
-            all_losses = torch.cat(datapoint_losses).float()
             self.training_logger.log_val_metrics(
                 datapoints_seen=log_train_datapoints_seen,
                 total_datapoint_count=log_train_total_datapoint_count,
@@ -567,7 +573,8 @@ class Trainer:
         val_datapoint_count: int,
         optimizer: torch.optim.Optimizer,
         log_every_n_datapoints: int = DEFAULT_LOG_EVERY_N,
-        log_image_count: int = DEFAULT_LOG_IMAGE_COUNT,
+        train_log_image_count: int = DEFAULT_TRAIN_LOG_IMAGE_COUNT,
+        val_log_image_count: int = DEFAULT_VAL_LOG_IMAGE_COUNT,
     ) -> None:
         """
         Train `model` w.r.t. `train_datapoint_count` sampled train datapoints.
@@ -577,12 +584,13 @@ class Trainer:
         model.train()
 
         datapoints_seen = 0
+        datapoints_seen_at_last_log = 0
+        datapoints_seen_at_last_checkpoint = None
+
         loss_sum_since_last_log = torch.zeros((), device=device)
         augmentations_since_last_log: list[Augmentation] = []
 
-        datapoints_seen_at_last_log = 0
         datapoint_index_for_next_log = log_every_n_datapoints
-        datapoints_seen_at_last_checkpoint = None
 
         try:
             val_metrics = self.validate(
@@ -590,7 +598,7 @@ class Trainer:
                 datapoint_count=val_datapoint_count,
                 log_train_datapoints_seen=0,
                 log_train_total_datapoint_count=train_datapoint_count,
-                log_image_count=log_image_count,
+                log_image_count=val_log_image_count,
             )
             self._save_checkpoint(
                 model,
@@ -660,12 +668,12 @@ class Trainer:
                                 ),
                             )
                         self.training_logger.log_images(
-                            log_base_name="train",
+                            log_base_name="03_quality_samples/train",
                             datapoints_seen=datapoints_seen,
                             images=images,
                             labels=labels,
                             logits=logits,
-                            num_images_to_log=log_image_count,
+                            num_images_to_log=train_log_image_count,
                         )
 
                     val_metrics = self.validate(
@@ -673,7 +681,7 @@ class Trainer:
                         datapoint_count=val_datapoint_count,
                         log_train_datapoints_seen=datapoints_seen,
                         log_train_total_datapoint_count=train_datapoint_count,
-                        log_image_count=log_image_count,
+                        log_image_count=val_log_image_count,
                     )
                     self._save_checkpoint(
                         model,
@@ -684,12 +692,12 @@ class Trainer:
                     )
                     datapoints_seen_at_last_checkpoint = datapoints_seen
                     self._update_teacher(model, datapoints_seen)
+                    time_of_last_log = time.perf_counter()
 
+                    datapoints_seen_at_last_log = datapoints_seen
                     loss_sum_since_last_log.zero_()
                     augmentations_since_last_log.clear()
 
-                    time_of_last_log = time.perf_counter()
-                    datapoints_seen_at_last_log = datapoints_seen
                     datapoint_index_for_next_log = (
                         datapoints_seen // log_every_n_datapoints + 1
                     ) * log_every_n_datapoints

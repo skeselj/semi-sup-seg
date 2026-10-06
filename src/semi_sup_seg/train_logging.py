@@ -17,7 +17,8 @@ from semi_sup_seg.data.labels import LabelMetadata
 logger = logging.getLogger(__name__)
 
 DEFAULT_LOG_EVERY_N = 500
-DEFAULT_LOG_IMAGE_COUNT = 2
+DEFAULT_TRAIN_LOG_IMAGE_COUNT = 3
+DEFAULT_VAL_LOG_IMAGE_COUNT = 2
 DEFAULT_LOG_IMAGE_DOWNSCALE = 2
 
 
@@ -103,9 +104,12 @@ class TrainingLogger:
 
         if self.writer is not None:
             for name, value in [
-                ("train/datapoints_per_second", datapoints_per_second),
-                ("train/loss", loss),
-                ("train/learning_rate", learning_rate),
+                (
+                    "00_performance/train/datapoints_per_second",
+                    datapoints_per_second,
+                ),
+                ("98_hyperparams/train/learning_rate", learning_rate),
+                ("02_quality_metrics/train/loss", loss),
             ]:
                 self.writer.add_scalar(name, value, datapoints_seen)
 
@@ -121,7 +125,7 @@ class TrainingLogger:
 
         for name, values in augmentation.to_dict().items():
             self.writer.add_histogram(
-                f"train_augmentation/{name}",
+                f"99_data_augmentation/train/{name}",
                 values.float().cpu(),
                 datapoints_seen,
             )
@@ -156,14 +160,18 @@ class TrainingLogger:
         # fmt: on
 
         if self.writer is not None:
-            self.writer.add_scalar("val/loss_avg", loss_avg, datapoints_seen)
             self.writer.add_scalar(
-                "val/loss_stddev", loss_stddev, datapoints_seen
+                "02_quality_metrics/val/loss_avg", loss_avg, datapoints_seen
+            )
+            self.writer.add_scalar(
+                "02_quality_metrics/val/loss_stddev",
+                loss_stddev,
+                datapoints_seen,
             )
             for name, value in metrics.items():
                 if not math.isnan(value):
                     self.writer.add_scalar(
-                        f"val/{name}", value, datapoints_seen
+                        f"02_quality_metrics/val/{name}", value, datapoints_seen
                     )
 
     @torch.no_grad()
