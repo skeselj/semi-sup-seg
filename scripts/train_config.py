@@ -111,6 +111,7 @@ class TrainingConfig:
     base_width: int | None = None
     base_channel_count: int | None = None
     level_count: int | None = None
+    conv_kernel_sizes: tuple[int, ...] | None = None  # One per level.
 
     loss_fn_name: str = "cross_entropy"
     learning_rate: float = 1e-4
@@ -170,8 +171,8 @@ def get_unet_config(
     init_checkpoint: dict[str, Any] | None,
     init_checkpoint_path: Path | None,
     output_channel_count: int,
-    **requested: int | None,
-) -> dict[str, int]:
+    **requested: int | tuple[int, ...] | None,
+) -> dict[str, int | tuple[int, ...]]:
     """
     Get UNet constructor arguments for a new or checkpointed model.
 
@@ -184,6 +185,7 @@ def get_unet_config(
             "base_width": DEFAULT_BASE_WIDTH,
             "base_channel_count": UNet.DEFAULT_BASE_CHANNEL_COUNT,
             "level_count": UNet.DEFAULT_LEVEL_COUNT,
+            "conv_kernel_sizes": UNet.DEFAULT_CONV_SIZES,
         }
         return {
             "output_channel_count": output_channel_count,
@@ -202,6 +204,8 @@ def get_unet_config(
         )
 
     for name, value in requested.items():
+        if isinstance(value, list):
+            value = tuple(value)
         if value is not None and value != config[name]:
             raise ValueError(
                 f"{name}={value} conflicts with {name}={config[name]} in "
@@ -253,19 +257,19 @@ TRAINING_PRESETS: dict[str, TrainingConfig] = {
         ),
         unlabeled_data=PlainUnlabeledDataConfig(
             dataset_class=CityscapesUnlabeledDataset,
-            is_oos_splits=("non_southern",),
-            keep_every_nth_frame=3,
+            is_oos_splits=("southern", "non_southern"),
+            keep_every_nth_frame=2,
         ),
         pseudo_labeling=PseudoLabelingConfig(
-            warmup_datapoints_before_pseudo_labeling=0,
+            warmup_datapoints_before_pseudo_labeling=10_000,
             labeled_to_unlabeled_ratio=(2, 6),
             labeled_and_unlabeled_loss_multipliers=(4 / 2, 4 / 6),
-            teacher_lag=0,
+            teacher_lag=10_000,
             teacher_ema_decay=0.9,
-            teacher_min_confidence=None,
+            teacher_min_confidence=0.60,
         ),
         augmentation_sampler=AugmentationSampler(),
-        train_datapoint_count=500_000,
+        train_datapoint_count=1_000_000,
         val_datapoint_count=None,
         train_batch_size=8,
         val_batch_size=1,

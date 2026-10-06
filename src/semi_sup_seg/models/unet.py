@@ -145,11 +145,38 @@ class UNet(nn.Module):
     Basic implementation of the U-Net architecture for per-pixel classification.
     """
 
-    CONV_KERNEL_SIZE = 3
-    CONV_PADDING = CONV_KERNEL_SIZE // 2
-
     DEFAULT_BASE_CHANNEL_COUNT = 32
     DEFAULT_LEVEL_COUNT = 5
+    BRIDGE_CONV_SIZE = 3
+    DEFAULT_CONV_SIZES = (3, 3, 5, 5, 5)  # Per-level.
+
+    @classmethod
+    def get_conv_kernel_sizes(
+        cls, conv_kernel_sizes: tuple[int, ...] | None, level_count: int
+    ) -> tuple[int, ...]:
+        """
+        Get validated per-level conv kernel sizes, filling in the default.
+        """
+
+        if conv_kernel_sizes is None:
+            if level_count != len(cls.DEFAULT_CONV_SIZES):
+                raise ValueError(
+                    f"{cls.DEFAULT_CONV_SIZES=} is for "
+                    f"{len(cls.DEFAULT_CONV_SIZES)} levels, so set "
+                    f"conv_kernel_sizes for {level_count=}."
+                )
+            return cls.DEFAULT_CONV_SIZES
+
+        conv_kernel_sizes = tuple(conv_kernel_sizes)
+        if len(conv_kernel_sizes) != level_count:
+            raise ValueError(
+                f"{conv_kernel_sizes=} must have one size per level, "
+                f"{level_count=}."
+            )
+        if any(size < 1 or size % 2 == 0 for size in conv_kernel_sizes):
+            raise ValueError(f"{conv_kernel_sizes=} must all be odd.")
+
+        return conv_kernel_sizes
 
     def __init__(
         self,
@@ -160,6 +187,7 @@ class UNet(nn.Module):
         input_channel_count: int = IMAGE_CHANNEL_COUNT,
         base_channel_count: int = DEFAULT_BASE_CHANNEL_COUNT,
         level_count: int = DEFAULT_LEVEL_COUNT,
+        conv_kernel_sizes: tuple[int, ...] | None = None,
     ):
         """
         Construct the model.
@@ -176,6 +204,8 @@ class UNet(nn.Module):
             base_channel_count: number of channels in the output of the 1st
                 level of processing.
             level_count: number of levels of processing.
+            conv_kernel_sizes: per level, the (odd) kernel size of its encoder
+                & decoder convs. None means DEFAULT_CONV_SIZES.
         """
 
         super().__init__()
@@ -198,6 +228,9 @@ class UNet(nn.Module):
         self.input_channel_count = input_channel_count
         self.base_channel_count = base_channel_count
         self.level_count = level_count
+        self.conv_kernel_sizes = self.get_conv_kernel_sizes(
+            conv_kernel_sizes, level_count
+        )
 
         # Level --> number of output feature maps.
         channel_counts = [
@@ -209,22 +242,23 @@ class UNet(nn.Module):
         self.input_bridge = nn.Conv2d(
             in_channels=input_channel_count,
             out_channels=input_bridge_channel_count,
-            kernel_size=self.CONV_KERNEL_SIZE,
-            padding=self.CONV_PADDING,
+            kernel_size=self.BRIDGE_CONV_SIZE,
+            padding=self.BRIDGE_CONV_SIZE // 2,
         )
 
         # On the encoder side, a conv op turns C feature maps into 2*C maps.
+        encoder_input_channel_counts = [
+            input_bridge_channel_count,
+            *channel_counts[:-1],
+        ]
         self.encoder_conv_ops = nn.ModuleList(
             _ConvOp(
-                input_channel_count=level_input_channel_count,
-                output_channel_count=level_output_channel_count,
-                conv_kernel_size=self.CONV_KERNEL_SIZE,
-                conv_padding=self.CONV_PADDING,
+                input_channel_count=encoder_input_channel_counts[level],
+                output_channel_count=channel_counts[level],
+                conv_kernel_size=self.conv_kernel_sizes[level],
+                conv_padding=self.conv_kernel_sizes[level] // 2,
             )
-            for level_input_channel_count, level_output_channel_count in zip(
-                [input_bridge_channel_count, *channel_counts[:-1]],
-                channel_counts,
-            )
+            for level in range(level_count)
         )
         # Down-sampling happens after all but the last encoder-side conv op.
         self.downsample_ops = nn.ModuleList(
@@ -237,8 +271,8 @@ class UNet(nn.Module):
             _ConvOp(
                 input_channel_count=2 * channel_counts[level],
                 output_channel_count=channel_counts[level],
-                conv_kernel_size=self.CONV_KERNEL_SIZE,
-                conv_padding=self.CONV_PADDING,
+                conv_kernel_size=self.conv_kernel_sizes[level],
+                conv_padding=self.conv_kernel_sizes[level] // 2,
             )
             for level in range(level_count - 1)
         )
@@ -255,8 +289,8 @@ class UNet(nn.Module):
         self.output_bridge = nn.Conv2d(
             in_channels=channel_counts[0],
             out_channels=output_channel_count,
-            kernel_size=self.CONV_KERNEL_SIZE,
-            padding=self.CONV_PADDING,
+            kernel_size=self.BRIDGE_CONV_SIZE,
+            padding=self.BRIDGE_CONV_SIZE // 2,
         )
 
         self.reset_parameters()
@@ -271,10 +305,12 @@ class UNet(nn.Module):
             shape = f"({channel_counts[level]:>4}, {base_height // 2**level:>4}, {base_width // 2**level:>4})"
             has_decoder = level < len(self.decoder_conv_ops)
 
+            kernel_size = self.conv_kernel_sizes[level]
             level_lines.append(
                 f"\tlevel {level}: "
                 f"encoder {shape}, "
-                f"decoder {shape if has_decoder else 'none'}"
+                f"decoder {shape if has_decoder else 'none'}, "
+                f"{kernel_size}x{kernel_size} convs"
             )
 
         logger.info(
@@ -286,7 +322,7 @@ class UNet(nn.Module):
         # fmt: on
 
     @property
-    def config(self) -> dict[str, int]:
+    def config(self) -> dict[str, int | tuple[int, ...]]:
         """
         Get the arguments this model was constructed with.
         """
@@ -298,6 +334,7 @@ class UNet(nn.Module):
             "input_channel_count": self.input_channel_count,
             "base_channel_count": self.base_channel_count,
             "level_count": self.level_count,
+            "conv_kernel_sizes": self.conv_kernel_sizes,
         }
 
     def reset_parameters(self) -> None:
