@@ -2,14 +2,13 @@
 Try using the ("alpine", "non-alpine") split.
 """
 
+# Need to see some decent performance from this, maybe 0.5 IoU.
 PROFILE_RESOURCES=1 PROFILE_RESOURCES_TORCH=1 \
-python ./train.py "plain_supervised" 1st_alpine &> \
-../logs/stdout/1st_alpine_plain_supervised.txt
+python ./train.py augmented_supervised southern_split &> \
+../logs/stdout/southern_split_augmented_supervised.txt
 
+# Then will do semi-supervised, initializing from that checkpoint. 
 PROFILE_RESOURCES=1 PROFILE_RESOURCES_TORCH=1 \
-python ./train.py "augmented_supervised" 1st_alpine &> \
-../logs/stdout/1st_alpine_augmented_supervised.txt
+python ./train.py augmented_semisupervised southern_split &> \
+../logs/stdout/southern_split_augmented_semisupervised.txt
 
-PROFILE_RESOURCES=1 PROFILE_RESOURCES_TORCH=1 \
-python ./train.py "augmented_semisupervised" 1st_alpine &> \
-../logs/stdout/1st_alpine_augmented_semisupervised.txt

@@ -535,9 +535,22 @@ class Trainer:
                         else None
                     ),
                 },
+                teacher=self._get_teacher(),
             )
 
         logger.info(f"Saved checkpoint to '{path}'.")
+
+    def _get_teacher(self) -> nn.Module | None:
+        """
+        Get the pseudo-labeler, if any.
+        """
+
+        if (
+            self.pseudo_labeler is None
+            or self.pseudo_labeler.teacher_datapoints_seen is None
+        ):
+            return None
+        return self.pseudo_labeler.model
 
     def _update_teacher(self, model: nn.Module, datapoints_seen: int) -> None:
         """

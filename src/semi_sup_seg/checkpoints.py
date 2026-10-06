@@ -38,6 +38,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     grad_scaler: torch.amp.GradScaler,
     metadata: dict[str, Any],
+    teacher: nn.Module | None = None,
 ) -> None:
     """
     Save a checkpoint to `path`, atomically: a crash never leaves a partial one.
@@ -53,6 +54,7 @@ def save_checkpoint(
             "optimizer": optimizer.state_dict(),
             "grad_scaler": grad_scaler.state_dict(),
             "metadata": metadata,
+            "teacher": None if teacher is None else teacher.state_dict(),
         },
         temporary_path,
     )

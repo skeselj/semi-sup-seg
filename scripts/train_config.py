@@ -232,12 +232,12 @@ TRAINING_PRESETS: dict[str, TrainingConfig] = {
     "augmented_supervised": TrainingConfig(
         labeled_data=LabeledDataConfig(
             dataset_class=CityscapesPersonLabeledDataset,
-            train_is_oos_splits=("alpine",),
-            val_is_oos_splits=("non_alpine",),
+            train_is_oos_splits=("southern",),
+            val_is_oos_splits=("non_southern",),
         ),
         pseudo_labeling=None,
         augmentation_sampler=AugmentationSampler(),
-        train_datapoint_count=400_000,
+        train_datapoint_count=500_000,
         val_datapoint_count=None,
         train_batch_size=8,
         val_batch_size=1,
@@ -248,28 +248,29 @@ TRAINING_PRESETS: dict[str, TrainingConfig] = {
     "augmented_semisupervised": TrainingConfig(
         labeled_data=LabeledDataConfig(
             dataset_class=CityscapesPersonLabeledDataset,
-            train_is_oos_splits=("alpine",),
-            val_is_oos_splits=("non_alpine",),
+            train_is_oos_splits=("southern",),
+            val_is_oos_splits=("non_southern",),
         ),
         unlabeled_data=PlainUnlabeledDataConfig(
             dataset_class=CityscapesUnlabeledDataset,
-            is_oos_splits=("non_alpine",),
+            is_oos_splits=("non_southern",),
             keep_every_nth_frame=3,
         ),
         pseudo_labeling=PseudoLabelingConfig(
-            warmup_datapoints_before_pseudo_labeling=400_000,
+            warmup_datapoints_before_pseudo_labeling=0,
             labeled_to_unlabeled_ratio=(2, 6),
             labeled_and_unlabeled_loss_multipliers=(4 / 2, 4 / 6),
-            teacher_lag=50_000,
+            teacher_lag=0,
+            teacher_ema_decay=0.9,
             teacher_min_confidence=None,
         ),
         augmentation_sampler=AugmentationSampler(),
-        train_datapoint_count=2_000_000,
+        train_datapoint_count=500_000,
         val_datapoint_count=None,
         train_batch_size=8,
         val_batch_size=1,
-        init_checkpoint_path=None,
-        learning_rate=5e-5,
+        init_checkpoint_path=Path("/home/stefan/hdd/projects/semi-sup-seg/logs/runs/southern_split_augmented_supervised_unet_cityscapes_20261006_075451/checkpoint_100000.pt"),
+        learning_rate=1e-4,
         log_every_n_datapoints=10_000,
     )
 }

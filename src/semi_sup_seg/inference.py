@@ -22,11 +22,12 @@ class PseudoLabelingConfig:
     """
 
     # fmt: off
-    warmup_datapoints_before_pseudo_labeling: int = 300_000
-    labeled_to_unlabeled_ratio: tuple[int, int] = (1, 7)
-    labeled_and_unlabeled_loss_multipliers: tuple[float, float] = (4/1, 4/7)
+    warmup_datapoints_before_pseudo_labeling: int
+    labeled_to_unlabeled_ratio: tuple[int, int]
+    labeled_and_unlabeled_loss_multipliers: tuple[float, float]
 
-    teacher_lag: int = 10_000
+    teacher_lag: int = 0
+    teacher_ema_decay: float | None = 0.9
     teacher_min_confidence: float | None = None
     # fmt: on
 
@@ -45,6 +46,11 @@ class PseudoLabelingConfig:
                 f"{self.labeled_and_unlabeled_loss_multipliers=} must be "
                 "non-negative."
             )
+        if (
+            self.teacher_ema_decay is not None
+            and not 0 <= self.teacher_ema_decay < 1
+        ):
+            raise ValueError(f"{self.teacher_ema_decay=} must be in [0, 1).")
         if (
             self.teacher_min_confidence is not None
             and not 0 <= self.teacher_min_confidence < 1
@@ -80,12 +86,27 @@ class PseudoLabeler:
 
         # Train datapoints seen --> CPU copy of the student's state then.
         self.teacher_candidate_states: dict[int, dict[str, torch.Tensor]] = {}
-        # Train datapoints seen when the teacher's state was checkpointed.
+        # Train datapoints seen when student state was last taken into teacher.
         self.teacher_datapoints_seen: int | None = None
+
+    @torch.no_grad()
+    def _blend_into_teacher(
+        self, state: dict[str, torch.Tensor], decay: float
+    ) -> None:
+        """
+        Set the teacher to `decay * teacher + (1 - decay) * state`, in place.
+        """
+
+        for name, tensor in self.model.state_dict().items():
+            other = state[name].to(tensor.device)
+            if tensor.is_floating_point():
+                tensor.mul_(decay).add_(other, alpha=1 - decay)
+            else:
+                tensor.copy_(other)
 
     def update_teacher(self, student: nn.Module, datapoints_seen: int) -> None:
         """
-        Keep the student's current state, as a candidate to be the teacher.
+        Update the teacher's current state with `student`.
         """
 
         self.teacher_candidate_states[datapoints_seen] = {
@@ -104,7 +125,6 @@ class PseudoLabeler:
         if teacher_datapoints_seen is None:
             return
 
-        # Older states can't be the teacher anymore.
         for candidate in list(self.teacher_candidate_states):
             if candidate < teacher_datapoints_seen:
                 del self.teacher_candidate_states[candidate]
@@ -116,14 +136,22 @@ class PseudoLabeler:
         ):
             return
 
-        self.model.load_state_dict(
-            self.teacher_candidate_states[teacher_datapoints_seen]
-        )
+        candidate_state = self.teacher_candidate_states[teacher_datapoints_seen]
+        decay = self.config.teacher_ema_decay
+        if decay is None or self.teacher_datapoints_seen is None:
+            self.model.load_state_dict(candidate_state)
+            logger.info(
+                f"Taking the {teacher_datapoints_seen:,} datapoint student, "
+                f"model, and setting teacher to it."
+            )
+        else:
+            self._blend_into_teacher(candidate_state, decay)
+            logger.info(
+                f"Taking the {teacher_datapoints_seen:,} datapoint student, "
+                f"and incorporating it into teacher with {decay=}."
+            )
+
         self.teacher_datapoints_seen = teacher_datapoints_seen
-        logger.info(
-            "Teacher is now the model after "
-            f"{teacher_datapoints_seen:,} train datapoints."
-        )
 
     @torch.no_grad()
     def predict_logits(self, images: torch.Tensor) -> torch.Tensor:
