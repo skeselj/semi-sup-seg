@@ -97,6 +97,7 @@ def train_unet_on_cityscapes(config: TrainingConfig) -> UNet:
         base_channel_count=config.base_channel_count,
         level_count=config.level_count,
         conv_kernel_sizes=config.conv_kernel_sizes,
+        norm_group_channel_count=config.norm_group_channel_count,
     )
 
     with profiler.session():

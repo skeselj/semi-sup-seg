@@ -111,7 +111,8 @@ class TrainingConfig:
     base_width: int | None = None
     base_channel_count: int | None = None
     level_count: int | None = None
-    conv_kernel_sizes: tuple[int, ...] | None = None  # One per level.
+    conv_kernel_sizes: tuple[int, ...] | None = None
+    norm_group_channel_count: int | None = None 
 
     loss_fn_name: str = "cross_entropy"
     learning_rate: float = 1e-4
@@ -186,6 +187,7 @@ def get_unet_config(
             "base_channel_count": UNet.DEFAULT_BASE_CHANNEL_COUNT,
             "level_count": UNet.DEFAULT_LEVEL_COUNT,
             "conv_kernel_sizes": UNet.DEFAULT_CONV_SIZES,
+            "norm_group_channel_count": UNet.DEFAULT_NORM_GROUP_CHANNEL_COUNT,
         }
         return {
             "output_channel_count": output_channel_count,
@@ -225,7 +227,7 @@ TRAINING_PRESETS: dict[str, TrainingConfig] = {
         ),
         pseudo_labeling=None,
         augmentation_sampler=None,
-        train_datapoint_count=100_000,
+        train_datapoint_count=400_000,
         val_datapoint_count=None,
         train_batch_size=8,
         val_batch_size=1,

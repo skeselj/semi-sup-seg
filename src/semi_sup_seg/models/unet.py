@@ -43,19 +43,35 @@ def _init_conv(
     layer: nn.Conv2d | nn.ConvTranspose2d, scale: float = 1.0
 ) -> None:
     """
-    Initialize weights from N(0, scale**2 / fan-in), and biases to 0.
+    Initialize weights from N(0, scale**2 / fan-in), and biases, if any, to 0.
     """
 
     std = scale * (1 / _fan_in(layer)) ** 0.5
     nn.init.normal_(layer.weight, mean=0.0, std=std)
-    nn.init.zeros_(layer.bias)
+    if layer.bias is not None:
+        nn.init.zeros_(layer.bias)
+
+
+def _make_norm(channel_count: int, group_channel_count: int) -> nn.Module:
+    """
+    Make GroupNorm over groups of `group_channel_count` channels (no-op if 0).
+    """
+
+    if group_channel_count == 0:
+        return nn.Identity()
+
+    return nn.GroupNorm(
+        num_groups=channel_count // group_channel_count,
+        num_channels=channel_count,
+    )
 
 
 class _ConvOp(nn.Module):
     """
     The enhanced convolution operation used in this module.
 
-    Two convolutional layers with a skip connection at the end.
+    Two convolutional layers with a skip connection at the end. Each conv is
+    followed by GroupNorm, if `norm_group_channel_count` is set, then ReLU.
     """
 
     def __init__(
@@ -64,20 +80,26 @@ class _ConvOp(nn.Module):
         output_channel_count: int,
         conv_kernel_size: int,
         conv_padding: int,
+        norm_group_channel_count: int = 0,
     ):
         super().__init__()
+        is_normed = norm_group_channel_count > 0
         self.conv_1 = nn.Conv2d(
             in_channels=input_channel_count,
             out_channels=output_channel_count,
             kernel_size=conv_kernel_size,
             padding=conv_padding,
+            bias=not is_normed,  # GroupNorm's shift does what a bias would.
         )
         self.conv_2 = nn.Conv2d(
             in_channels=output_channel_count,
             out_channels=output_channel_count,
             kernel_size=conv_kernel_size,
             padding=conv_padding,
+            bias=not is_normed,
         )
+        self.norm_1 = _make_norm(output_channel_count, norm_group_channel_count)
+        self.norm_2 = _make_norm(output_channel_count, norm_group_channel_count)
         self.activation = nn.ReLU()
 
         self.reset_parameters()
@@ -91,8 +113,8 @@ class _ConvOp(nn.Module):
         _init_conv(self.conv_2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        activations_1 = self.activation(self.conv_1(x))
-        activations_2 = self.activation(self.conv_2(activations_1))
+        activations_1 = self.activation(self.norm_1(self.conv_1(x)))
+        activations_2 = self.activation(self.norm_2(self.conv_2(activations_1)))
         return activations_1 + activations_2
 
 
@@ -149,6 +171,7 @@ class UNet(nn.Module):
     DEFAULT_LEVEL_COUNT = 5
     BRIDGE_CONV_SIZE = 3
     DEFAULT_CONV_SIZES = (3, 3, 5, 5, 5)  # Per-level.
+    DEFAULT_NORM_GROUP_CHANNEL_COUNT = 16
 
     @classmethod
     def get_conv_kernel_sizes(
@@ -188,6 +211,7 @@ class UNet(nn.Module):
         base_channel_count: int = DEFAULT_BASE_CHANNEL_COUNT,
         level_count: int = DEFAULT_LEVEL_COUNT,
         conv_kernel_sizes: tuple[int, ...] | None = None,
+        norm_group_channel_count: int = DEFAULT_NORM_GROUP_CHANNEL_COUNT,
     ):
         """
         Construct the model.
@@ -206,6 +230,9 @@ class UNet(nn.Module):
             level_count: number of levels of processing.
             conv_kernel_sizes: per level, the (odd) kernel size of its encoder
                 & decoder convs. None means DEFAULT_CONV_SIZES.
+            norm_group_channel_count: each conv in a conv op is followed by
+                GroupNorm over groups of this many channels, or by nothing if
+                it's 0. Must divide every level's channel count.
         """
 
         super().__init__()
@@ -231,11 +258,20 @@ class UNet(nn.Module):
         self.conv_kernel_sizes = self.get_conv_kernel_sizes(
             conv_kernel_sizes, level_count
         )
+        self.norm_group_channel_count = norm_group_channel_count
 
         # Level --> number of output feature maps.
         channel_counts = [
             base_channel_count * 2**level for level in range(level_count)
         ]
+        if norm_group_channel_count < 0 or (
+            norm_group_channel_count > 0
+            and base_channel_count % norm_group_channel_count
+        ):
+            raise ValueError(
+                f"{norm_group_channel_count=} must be 0, or divide "
+                f"{base_channel_count=}, and so every level's channel count."
+            )
         input_bridge_channel_count = base_channel_count // 2
 
         # Converts input image to feature maps processable by 1st level.
@@ -257,6 +293,7 @@ class UNet(nn.Module):
                 output_channel_count=channel_counts[level],
                 conv_kernel_size=self.conv_kernel_sizes[level],
                 conv_padding=self.conv_kernel_sizes[level] // 2,
+                norm_group_channel_count=norm_group_channel_count,
             )
             for level in range(level_count)
         )
@@ -273,6 +310,7 @@ class UNet(nn.Module):
                 output_channel_count=channel_counts[level],
                 conv_kernel_size=self.conv_kernel_sizes[level],
                 conv_padding=self.conv_kernel_sizes[level] // 2,
+                norm_group_channel_count=norm_group_channel_count,
             )
             for level in range(level_count - 1)
         )
@@ -335,6 +373,7 @@ class UNet(nn.Module):
             "base_channel_count": self.base_channel_count,
             "level_count": self.level_count,
             "conv_kernel_sizes": self.conv_kernel_sizes,
+            "norm_group_channel_count": self.norm_group_channel_count,
         }
 
     def reset_parameters(self) -> None:
