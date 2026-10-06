@@ -2,7 +2,7 @@
 Pipeline to write videos of datasets, for viewing.
 
 Example usage:
-python pipelines/dataset_visualization.py
+python scripts/dataset_visualization.py
 """
 
 import collections

@@ -213,12 +213,14 @@ def get_unet_config(
 
 # fmt: off
 TRAINING_PRESETS: dict[str, TrainingConfig] = {
-    "plain_supervised_small": TrainingConfig(
+    "plain_supervised": TrainingConfig(
         labeled_data=LabeledDataConfig(
-            dataset_class=CityscapesPersonLabeledDataset
+            dataset_class=CityscapesPersonLabeledDataset,
+            train_is_oos_splits=("alpine",),
+            val_is_oos_splits=("non_alpine",),
         ),
-        augmentation_sampler=None,
         pseudo_labeling=None,
+        augmentation_sampler=None,
         train_datapoint_count=100_000,
         val_datapoint_count=None,
         train_batch_size=8,
@@ -227,13 +229,15 @@ TRAINING_PRESETS: dict[str, TrainingConfig] = {
         learning_rate=1e-4,
         log_every_n_datapoints=2_000,
     ),
-    "plain_supervised": TrainingConfig(
+    "augmented_supervised": TrainingConfig(
         labeled_data=LabeledDataConfig(
-            dataset_class=CityscapesPersonLabeledDataset
+            dataset_class=CityscapesPersonLabeledDataset,
+            train_is_oos_splits=("alpine",),
+            val_is_oos_splits=("non_alpine",),
         ),
-        augmentation_sampler=None,
         pseudo_labeling=None,
-        train_datapoint_count=250_000,
+        augmentation_sampler=AugmentationSampler(),
+        train_datapoint_count=400_000,
         val_datapoint_count=None,
         train_batch_size=8,
         val_batch_size=1,
@@ -241,62 +245,32 @@ TRAINING_PRESETS: dict[str, TrainingConfig] = {
         learning_rate=1e-4,
         log_every_n_datapoints=5_000,
     ),
-    "augmented_supervised": TrainingConfig(
+    "augmented_semisupervised": TrainingConfig(
         labeled_data=LabeledDataConfig(
-            dataset_class=CityscapesPersonLabeledDataset
+            dataset_class=CityscapesPersonLabeledDataset,
+            train_is_oos_splits=("alpine",),
+            val_is_oos_splits=("non_alpine",),
+        ),
+        unlabeled_data=PlainUnlabeledDataConfig(
+            dataset_class=CityscapesUnlabeledDataset,
+            is_oos_splits=("non_alpine",),
+            keep_every_nth_frame=3,
+        ),
+        pseudo_labeling=PseudoLabelingConfig(
+            warmup_datapoints_before_pseudo_labeling=400_000,
+            labeled_to_unlabeled_ratio=(2, 6),
+            labeled_and_unlabeled_loss_multipliers=(4 / 2, 4 / 6),
+            teacher_lag=50_000,
+            teacher_min_confidence=None,
         ),
         augmentation_sampler=AugmentationSampler(),
-        pseudo_labeling=None,
-        train_datapoint_count=1_000_000,
+        train_datapoint_count=2_000_000,
         val_datapoint_count=None,
         train_batch_size=8,
         val_batch_size=1,
         init_checkpoint_path=None,
-        learning_rate=1e-4,
+        learning_rate=5e-5,
         log_every_n_datapoints=10_000,
-    ),
-    "augmented_semisupervised": TrainingConfig(
-        labeled_data=LabeledDataConfig(dataset_class=CityscapesPersonLabeledDataset),
-        augmentation_sampler=AugmentationSampler(),
-        unlabeled_data=PlainUnlabeledDataConfig(),
-        pseudo_labeling=PseudoLabelingConfig(
-            warmup_datapoints_before_pseudo_labeling=50_000,
-            labeled_to_unlabeled_ratio=(1, 7),
-            labeled_and_unlabeled_loss_multipliers=(4 / 1, 4 / 7),
-            teacher_lag=50_000,
-            teacher_min_confidence=0.60,
-        ),
-        train_datapoint_count=3_000_000,
-        val_datapoint_count=None,
-        train_batch_size=8,
-        val_batch_size=1,
-        init_checkpoint_path=Path("./logs/runs/oct_04_evening_augmented_supervised_unet_cityscapes_20261004_215123/checkpoint_0950000.pt"),
-        learning_rate=1e-5,
-        log_every_n_datapoints=10_000,
-    ),
-    "augmented_semisupervised_mixture": TrainingConfig(
-        labeled_data=LabeledDataConfig(dataset_class=CityscapesPersonLabeledDataset),
-        augmentation_sampler=AugmentationSampler(),
-        unlabeled_data=MixtureUnlabeledDataConfig(
-            config_to_weight=(
-                (PlainUnlabeledDataConfig(is_oos_splits=("train",), keep_every_nth_frame=3), 2 / 6),
-                (PlainUnlabeledDataConfig(is_oos_splits=("val",), keep_every_nth_frame=1), 4 / 6),
-            ),
-        ),
-        pseudo_labeling=PseudoLabelingConfig(
-            warmup_datapoints_before_pseudo_labeling=50_000,
-            labeled_to_unlabeled_ratio=(2, 6),
-            labeled_and_unlabeled_loss_multipliers=(4 / 2, 4 / 6),
-            teacher_lag=50_000,
-            teacher_min_confidence=0.60,
-        ),
-        train_datapoint_count=3_000_000,
-        val_datapoint_count=None,
-        train_batch_size=8,
-        val_batch_size=1,
-        init_checkpoint_path=Path("./logs/runs/oct_04_evening_augmented_supervised_unet_cityscapes_20261004_215123/checkpoint_0950000.pt"),
-        learning_rate=1e-5,
-        log_every_n_datapoints=10_000,
-    ),
+    )
 }
 # fmt: on

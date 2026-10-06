@@ -27,7 +27,7 @@ class PseudoLabelingConfig:
     labeled_and_unlabeled_loss_multipliers: tuple[float, float] = (4/1, 4/7)
 
     teacher_lag: int = 10_000
-    teacher_min_confidence: float = 0.60
+    teacher_min_confidence: float | None = None
     # fmt: on
 
     def __post_init__(self) -> None:
@@ -45,7 +45,10 @@ class PseudoLabelingConfig:
                 f"{self.labeled_and_unlabeled_loss_multipliers=} must be "
                 "non-negative."
             )
-        if not 0 <= self.teacher_min_confidence < 1:
+        if (
+            self.teacher_min_confidence is not None
+            and not 0 <= self.teacher_min_confidence < 1
+        ):
             raise ValueError(
                 f"{self.teacher_min_confidence=} must be in [0, 1)."
             )
@@ -148,11 +151,15 @@ class PseudoLabeler:
         """
         Map float (B, 3, H, W) images in [0, 1] to (B, H, W) pseudo-labels.
 
-        Only labels with confidence above the teacher's minimum are kept;
-        the rest are ignored.
+        Only labels with confidence above the teacher's minimum are kept, if
+        it has one; the rest are ignored.
         """
 
         labels, confidences = self.predict(images)
-        is_ignored = confidences <= self.config.teacher_min_confidence
+        min_confidence = self.config.teacher_min_confidence
+        if min_confidence is None:
+            return labels
+
+        is_ignored = confidences <= min_confidence
 
         return labels.masked_fill(is_ignored, self.label_metadata.ignore_id)

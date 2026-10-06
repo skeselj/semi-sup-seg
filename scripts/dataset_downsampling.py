@@ -2,7 +2,7 @@
 Pipeline to write downsampled copies of datasets.
 
 Example usage:
-python pipelines/dataset_downsampling.py
+python scripts/dataset_downsampling.py
 """
 
 import logging
